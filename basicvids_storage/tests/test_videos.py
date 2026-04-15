@@ -63,6 +63,16 @@ class TestVideosUpload(BaseTestVideos):
         assert response_data["size_bytes"] == len(b"fake-video-bytes")
         assert response_data["author_id"] == 1
 
+    async def test_upload_video_unauthorized(self):
+        app.dependency_overrides.pop(get_current_user, None)
+        response = await request(
+            "POST",
+            self.method_url,
+            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+        )
+
+        assert response.status_code == 401
+
     async def test_upload_rejects_non_video(self):
         response = await request(
             "POST",
