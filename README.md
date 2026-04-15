@@ -59,6 +59,7 @@ Environment variables:
 | DATABASE_URL          | sqlite:///./data/database.db | Metadata database URL        |
 | VIDEO_STORAGE_DIR     | videos                 | Directory inside DATA_PATH for files |
 | MAX_UPLOAD_SIZE_BYTES | 2147483648             | Maximum upload size                 |
+| AUTH_CURRENT_USER_URL | http://basicvids_auth:8000/api/v1/users/detail/ | Auth service current-user endpoint |
 
 Project environment can be placed in:
 
@@ -76,19 +77,21 @@ Project environment can be placed in:
 ### Videos
 
 - **POST** `/api/v1/videos/upload/`
+  - **Requires:** authentication
   - **Form field:** `file`
   - **Accepts:** `video/*`
-  - **Response:** `{ id, original_filename, content_type, size_bytes, storage_backend, created_at }`
+  - **Response:** `{ id, original_filename, content_type, size_bytes, author_id, storage_backend, created_at }`
 
 - **GET** `/api/v1/videos/`
   - **Query parameters:** `offset` (default: 0), `limit` (default: 20, max: 100)
   - **Response:** `{ videos: [...], count }`
 
 - **GET** `/api/v1/videos/{video_id}`
-  - **Response:** `{ id, original_filename, content_type, size_bytes, storage_backend, created_at }`
+  - **Response:** `{ id, original_filename, content_type, size_bytes, author_id, storage_backend, created_at }`
 
 - **GET** `/api/v1/videos/{video_id}/download/`
   - **Response:** video file
 
 - **DELETE** `/api/v1/videos/{video_id}`
+  - **Requires:** authentication as the video author or an admin
   - **Response:** `{ "message": "Video deleted successfully" }`

@@ -5,8 +5,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, col, select
 
+from basicvids_storage.auth import CurrentUser, get_current_user
 from basicvids_storage.db import get_session
-from basicvids_storage.models.videos import Video, VideoList, VideoPublic
+from basicvids_storage.models.videos import Video, VideoDeleteResponse, VideoList, VideoPublic
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
@@ -27,6 +28,7 @@ async def upload_video(
     file: Annotated[UploadFile, File()],
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> Video:
     validate_video_upload(file)
 
@@ -35,6 +37,7 @@ async def upload_video(
         original_filename=file.filename,
         content_type=file.content_type,
         size_bytes=stored_object.size_bytes,
+        author_id=current_user.id,
         storage_backend=storage.name,
         storage_key=stored_object.key,
     )
@@ -97,17 +100,20 @@ async def download_video(
     )
 
 
-@router.delete("/{video_id}", status_code=200)
+@router.delete("/{video_id}", response_model=VideoDeleteResponse, status_code=200)
 async def delete_video(
     video_id: str,
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
-):
+    current_user: CurrentUser = Depends(get_current_user),
+) -> VideoDeleteResponse:
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    if video.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the author or an admin can delete this video")
 
     storage.delete(video.storage_key)
     session.delete(video)
     session.commit()
-    return {"message": "Video deleted successfully"}
+    return VideoDeleteResponse(message="Video deleted successfully")

@@ -14,6 +14,7 @@ class Video(SQLModel, table=True):
     original_filename: str = Field(max_length=255)
     content_type: str = Field(max_length=100)
     size_bytes: int = Field(ge=0)
+    author_id: int | None = Field(default=None, index=True)
     storage_backend: str = Field(default="disk", max_length=50)
     storage_key: str = Field(unique=True, max_length=500)
     created_at: datetime = Field(default_factory=utc_now)
@@ -26,6 +27,7 @@ class VideoPublic(BaseModel):
     original_filename: str
     content_type: str
     size_bytes: int
+    author_id: int | None = None
     storage_backend: str
     created_at: datetime
 
@@ -33,3 +35,7 @@ class VideoPublic(BaseModel):
 class VideoList(BaseModel):
     videos: list[VideoPublic]
     count: int
+
+
+class VideoDeleteResponse(BaseModel):
+    message: str
