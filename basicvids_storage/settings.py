@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./data/database.db"
     VIDEO_STORAGE_DIR: str = "videos"
     MAX_UPLOAD_SIZE_BYTES: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    MAX_THUMBNAIL_SIZE_BYTES: int = Field(default=1 * 1024 * 1024, gt=0)
+    THUMBNAIL_WIDTH: int = Field(default=320, gt=0)
+    THUMBNAIL_JPEG_QUALITY: int = Field(default=5, ge=2, le=31)
+    THUMBNAIL_GENERATION_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
     AUTH_CURRENT_USER_URL: str = "http://basicvids_auth:8000/api/v1/users/detail/"
 
     model_config = SettingsConfigDict(

@@ -4,8 +4,10 @@ from sqlmodel import Session, delete
 import httpx
 import pytest
 
+from basicvids_storage.routers import videos as videos_router
 from basicvids_storage.auth import CurrentUser, get_current_user
 from basicvids_storage.models.videos import Video, VideoPublic
+from basicvids_storage.thumbnails import GeneratedThumbnail
 from basicvids_storage.tests import app, engine, temporary_directory
 
 
@@ -73,6 +75,70 @@ class TestVideosUpload(BaseTestVideos):
         assert response_data["author_username"] == "user-1"
         assert response_data["title"] == "Test clip"
         assert response_data["description"] == "A test upload"
+        assert response_data["has_thumbnail"] is False
+
+    async def test_upload_video_with_thumbnail_success(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            data={
+                "title": "Test clip",
+                "description": "A test upload",
+            },
+            files={
+                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
+                "thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg"),
+            },
+        )
+
+        assert response.status_code == 201
+        response_data = response.json()
+        assert response_data["has_thumbnail"] is True
+
+    async def test_upload_video_generates_thumbnail_when_missing(self, monkeypatch, tmp_path):
+        async def generate_thumbnail(video_path, storage, settings):
+            assert video_path.exists()
+            source_path = tmp_path / "generated.jpg"
+            source_path.write_bytes(b"generated-image-bytes")
+            return GeneratedThumbnail(
+                stored_object=storage.save_file(source_path, ".jpg", settings.MAX_THUMBNAIL_SIZE_BYTES),
+                content_type="image/jpeg",
+            )
+
+        monkeypatch.setattr(videos_router, "generate_video_thumbnail", generate_thumbnail)
+
+        response = await request(
+            "POST",
+            self.method_url,
+            data={
+                "title": "Test clip",
+                "description": "A test upload",
+            },
+            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+        )
+
+        assert response.status_code == 201
+        response_data = response.json()
+        assert response_data["has_thumbnail"] is True
+
+        response = await request("GET", f"/api/v1/videos/{response_data['id']}/thumbnail/")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.content == b"generated-image-bytes"
+
+    async def test_upload_video_rejects_non_image_thumbnail(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            data={"title": "Test clip"},
+            files={
+                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
+                "thumbnail": ("notes.txt", b"text", "text/plain"),
+            },
+        )
+
+        assert response.status_code == 415
 
     async def test_upload_video_unauthorized(self):
         app.dependency_overrides.pop(get_current_user, None)
@@ -134,6 +200,66 @@ class TestVideosRead(BaseTestVideos):
         assert response.status_code == 200
         assert response.content == b"fake-video-bytes"
 
+    async def test_download_video_thumbnail_success(self):
+        response = await request(
+            "POST",
+            f"{self.method_url}/upload/",
+            data={"title": "Test clip"},
+            files={
+                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
+                "thumbnail": ("thumb.png", b"fake-image-bytes", "image/png"),
+            },
+        )
+        video = response.json()
+
+        response = await request("GET", f"{self.method_url}/{video['id']}/thumbnail/")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.content == b"fake-image-bytes"
+
+    async def test_download_video_thumbnail_not_found(self):
+        video = await self.create_video()
+        response = await request("GET", f"{self.method_url}/{video['id']}/thumbnail/")
+
+        assert response.status_code == 404
+
+    async def test_set_video_thumbnail_success(self):
+        video = await self.create_video()
+        stored_files = list(Path(temporary_directory.name).iterdir())
+        assert len(stored_files) == 1
+
+        response = await request(
+            "PUT",
+            f"{self.method_url}/{video['id']}/thumbnail/",
+            files={"thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["has_thumbnail"] is True
+        assert len(list(Path(temporary_directory.name).iterdir())) == 2
+
+        response = await request(
+            "PUT",
+            f"{self.method_url}/{video['id']}/thumbnail/",
+            files={"thumbnail": ("new-thumb.jpg", b"new-image-bytes", "image/jpeg")},
+        )
+
+        assert response.status_code == 200
+        assert len(list(Path(temporary_directory.name).iterdir())) == 2
+
+    async def test_set_video_thumbnail_forbidden_for_non_author(self):
+        video = await self.create_video()
+        set_current_user(user(user_id=2))
+
+        response = await request(
+            "PUT",
+            f"{self.method_url}/{video['id']}/thumbnail/",
+            files={"thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg")},
+        )
+
+        assert response.status_code == 403
+
     async def test_change_video_success(self):
         video = await self.create_video()
         response = await request(
@@ -166,9 +292,18 @@ class TestVideosRead(BaseTestVideos):
         assert response.status_code == 403
 
     async def test_delete_video_success(self):
-        video = await self.create_video()
+        response = await request(
+            "POST",
+            f"{self.method_url}/upload/",
+            data={"title": "Test clip"},
+            files={
+                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
+                "thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg"),
+            },
+        )
+        video = response.json()
         stored_files = list(Path(temporary_directory.name).iterdir())
-        assert len(stored_files) == 1
+        assert len(stored_files) == 2
 
         response = await request("DELETE", f"{self.method_url}/{video['id']}")
 

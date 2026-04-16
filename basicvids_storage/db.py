@@ -33,6 +33,12 @@ def migrate_video_columns():
             connection.execute(text("ALTER TABLE video ADD COLUMN author_first_name VARCHAR(100)"))
         if "author_last_name" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN author_last_name VARCHAR(100)"))
+        if "thumbnail_storage_key" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_storage_key VARCHAR(500)"))
+        if "thumbnail_content_type" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_content_type VARCHAR(100)"))
+        if "thumbnail_size_bytes" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_size_bytes INTEGER"))
 
 
 async def get_session():

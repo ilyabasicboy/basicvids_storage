@@ -11,6 +11,7 @@ from basicvids_storage.models.videos import Video, VideoChange, VideoDeleteRespo
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
+from basicvids_storage.thumbnails import generate_video_thumbnail
 
 
 router = APIRouter(tags=["Videos"], prefix="/videos")
@@ -23,37 +24,107 @@ def validate_video_upload(file: UploadFile) -> None:
         raise HTTPException(status_code=415, detail="Only video uploads are supported")
 
 
+def validate_thumbnail_upload(file: UploadFile) -> None:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Thumbnail filename is required")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Only image thumbnails are supported")
+
+
 @router.post("/upload/", response_model=VideoPublic, status_code=201)
 async def upload_video(
     file: Annotated[UploadFile, File()],
     title: Annotated[str, Form()],
     description: Annotated[str | None, Form()] = None,
+    thumbnail: Annotated[UploadFile | None, File()] = None,
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Video:
     validate_video_upload(file)
+    if thumbnail:
+        validate_thumbnail_upload(thumbnail)
     clean_title = title.strip()
     if not clean_title:
         raise HTTPException(status_code=400, detail="Title is required")
 
-    stored_object = await storage.save_upload(file, settings.MAX_UPLOAD_SIZE_BYTES)
-    video = Video(
-        title=clean_title,
-        description=description.strip() if description else None,
-        original_filename=file.filename,
-        content_type=file.content_type,
-        size_bytes=stored_object.size_bytes,
-        author_id=current_user.id,
-        author_username=current_user.username,
-        author_first_name=current_user.first_name,
-        author_last_name=current_user.last_name,
-        storage_backend=storage.name,
-        storage_key=stored_object.key,
-    )
+    stored_object = None
+    stored_thumbnail = None
+    try:
+        stored_object = await storage.save_upload(file, settings.MAX_UPLOAD_SIZE_BYTES)
+        if thumbnail:
+            stored_thumbnail = await storage.save_upload(thumbnail, settings.MAX_THUMBNAIL_SIZE_BYTES)
+            thumbnail_content_type = thumbnail.content_type
+        else:
+            generated_thumbnail = await generate_video_thumbnail(storage.path_for(stored_object.key), storage, settings)
+            if generated_thumbnail:
+                stored_thumbnail = generated_thumbnail.stored_object
+                thumbnail_content_type = generated_thumbnail.content_type
+            else:
+                thumbnail_content_type = None
 
-    session.add(video)
-    session.commit()
+        video = Video(
+            title=clean_title,
+            description=description.strip() if description else None,
+            original_filename=file.filename,
+            content_type=file.content_type,
+            size_bytes=stored_object.size_bytes,
+            author_id=current_user.id,
+            author_username=current_user.username,
+            author_first_name=current_user.first_name,
+            author_last_name=current_user.last_name,
+            storage_backend=storage.name,
+            storage_key=stored_object.key,
+            thumbnail_storage_key=stored_thumbnail.key if stored_thumbnail else None,
+            thumbnail_content_type=thumbnail_content_type if stored_thumbnail else None,
+            thumbnail_size_bytes=stored_thumbnail.size_bytes if stored_thumbnail else None,
+        )
+
+        session.add(video)
+        session.commit()
+    except Exception:
+        session.rollback()
+        if stored_object:
+            storage.delete(stored_object.key)
+        if stored_thumbnail:
+            storage.delete(stored_thumbnail.key)
+        raise
+
+    session.refresh(video)
+    return video
+
+
+@router.put("/{video_id}/thumbnail/", response_model=VideoPublic)
+async def set_video_thumbnail(
+    video_id: str,
+    thumbnail: Annotated[UploadFile, File()],
+    session: Session = Depends(get_session),
+    storage: StorageBackend = Depends(get_storage),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> Video:
+    validate_thumbnail_upload(thumbnail)
+    video = session.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if video.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the author or an admin can change this video")
+
+    old_thumbnail_key = video.thumbnail_storage_key
+    stored_thumbnail = await storage.save_upload(thumbnail, settings.MAX_THUMBNAIL_SIZE_BYTES)
+    video.thumbnail_storage_key = stored_thumbnail.key
+    video.thumbnail_content_type = thumbnail.content_type
+    video.thumbnail_size_bytes = stored_thumbnail.size_bytes
+
+    try:
+        session.add(video)
+        session.commit()
+    except Exception:
+        session.rollback()
+        storage.delete(stored_thumbnail.key)
+        raise
+
+    if old_thumbnail_key:
+        storage.delete(old_thumbnail_key)
     session.refresh(video)
     return video
 
@@ -110,6 +181,33 @@ async def download_video(
     )
 
 
+@router.get("/{video_id}/thumbnail/")
+async def download_video_thumbnail(
+    video_id: str,
+    session: Session = Depends(get_session),
+    storage: StorageBackend = Depends(get_storage),
+) -> StreamingResponse:
+    video = session.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if not video.thumbnail_storage_key:
+        raise HTTPException(status_code=404, detail="Video thumbnail not found")
+
+    file_path = storage.path_for(video.thumbnail_storage_key)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Video thumbnail file not found")
+
+    async def stream_file():
+        with file_path.open("rb") as stored_file:
+            while chunk := stored_file.read(1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        stream_file(),
+        media_type=video.thumbnail_content_type or "application/octet-stream",
+    )
+
+
 @router.patch("/{video_id}", response_model=VideoPublic)
 async def change_video(
     video_id: str,
@@ -149,6 +247,8 @@ async def delete_video(
         raise HTTPException(status_code=403, detail="Only the author or an admin can delete this video")
 
     storage.delete(video.storage_key)
+    if video.thumbnail_storage_key:
+        storage.delete(video.thumbnail_storage_key)
     session.delete(video)
     session.commit()
     return VideoDeleteResponse(message="Video deleted successfully")

@@ -15,6 +15,9 @@ class StorageBackend(Protocol):
     async def save_upload(self, upload: UploadFile, max_size_bytes: int) -> StoredObject:
         ...
 
+    def save_file(self, source_path: Path, suffix: str, max_size_bytes: int) -> StoredObject:
+        ...
+
     def path_for(self, key: str) -> Path:
         ...
 

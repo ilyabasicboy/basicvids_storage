@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, computed_field
 from sqlmodel import Field, SQLModel
 
 
@@ -22,6 +22,9 @@ class Video(SQLModel, table=True):
     author_last_name: str | None = Field(default=None, max_length=100)
     storage_backend: str = Field(default="disk", max_length=50)
     storage_key: str = Field(unique=True, max_length=500)
+    thumbnail_storage_key: str | None = Field(default=None, max_length=500)
+    thumbnail_content_type: str | None = Field(default=None, max_length=100)
+    thumbnail_size_bytes: int | None = Field(default=None, ge=0)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -39,7 +42,13 @@ class VideoPublic(BaseModel):
     author_first_name: str | None = None
     author_last_name: str | None = None
     storage_backend: str
+    thumbnail_storage_key: str | None = PydanticField(default=None, exclude=True)
     created_at: datetime
+
+    @computed_field
+    @property
+    def has_thumbnail(self) -> bool:
+        return bool(self.thumbnail_storage_key)
 
 
 class VideoChange(BaseModel):

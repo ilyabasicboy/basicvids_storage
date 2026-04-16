@@ -38,6 +38,27 @@ class DiskStorage:
         temporary_path.replace(final_path)
         return DiskStoredObject(key=key, size_bytes=size_bytes)
 
+    def save_file(self, source_path: Path, suffix: str, max_size_bytes: int) -> DiskStoredObject:
+        self.root_path.mkdir(parents=True, exist_ok=True)
+
+        clean_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+        key = f"{uuid4().hex}{clean_suffix.lower()}"
+        final_path = self.path_for(key)
+        temporary_path = final_path.with_suffix(f"{final_path.suffix}.part")
+
+        size_bytes = 0
+        with Path(source_path).open("rb") as source, temporary_path.open("wb") as destination:
+            while chunk := source.read(1024 * 1024):
+                size_bytes += len(chunk)
+                if size_bytes > max_size_bytes:
+                    destination.close()
+                    temporary_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="File is too large")
+                destination.write(chunk)
+
+        temporary_path.replace(final_path)
+        return DiskStoredObject(key=key, size_bytes=size_bytes)
+
     def path_for(self, key: str) -> Path:
         candidate = (self.root_path / key).resolve()
         root = self.root_path.resolve()
