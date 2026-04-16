@@ -78,16 +78,21 @@ Project environment can be placed in:
 
 - **POST** `/api/v1/videos/upload/`
   - **Requires:** authentication
-  - **Form field:** `file`
+  - **Form fields:** `file`, `title`, `description` optional
   - **Accepts:** `video/*`
-  - **Response:** `{ id, original_filename, content_type, size_bytes, author_id, storage_backend, created_at }`
+  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
 
 - **GET** `/api/v1/videos/`
   - **Query parameters:** `offset` (default: 0), `limit` (default: 20, max: 100)
   - **Response:** `{ videos: [...], count }`
 
 - **GET** `/api/v1/videos/{video_id}`
-  - **Response:** `{ id, original_filename, content_type, size_bytes, author_id, storage_backend, created_at }`
+  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
+
+- **PATCH** `/api/v1/videos/{video_id}`
+  - **Requires:** authentication as the video author or an admin
+  - **Body:** `{ "title": "Video title", "description": "Description or null" }`
+  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
 
 - **GET** `/api/v1/videos/{video_id}/download/`
   - **Response:** video file

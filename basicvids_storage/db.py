@@ -11,20 +11,28 @@ def create_db_and_tables():
     settings.DATA_PATH.mkdir(parents=True, exist_ok=True)
     settings.video_storage_path.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(engine)
-    migrate_video_author_id()
+    migrate_video_columns()
 
 
-def migrate_video_author_id():
+def migrate_video_columns():
     inspector = inspect(engine)
     if "video" not in inspector.get_table_names():
         return
 
     columns = {column["name"] for column in inspector.get_columns("video")}
-    if "author_id" in columns:
-        return
-
     with engine.begin() as connection:
-        connection.execute(text("ALTER TABLE video ADD COLUMN author_id INTEGER"))
+        if "author_id" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN author_id INTEGER"))
+        if "title" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN title VARCHAR(255) DEFAULT '' NOT NULL"))
+        if "description" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN description VARCHAR(2000)"))
+        if "author_username" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN author_username VARCHAR(100)"))
+        if "author_first_name" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN author_first_name VARCHAR(100)"))
+        if "author_last_name" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN author_last_name VARCHAR(100)"))
 
 
 async def get_session():

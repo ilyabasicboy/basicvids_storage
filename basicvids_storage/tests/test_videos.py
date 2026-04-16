@@ -22,6 +22,8 @@ def user(user_id: int = 1, is_admin: bool = False) -> CurrentUser:
     return CurrentUser(
         id=user_id,
         username=f"user-{user_id}",
+        first_name="Test",
+        last_name="Author",
         email=f"user-{user_id}@example.com",
         is_admin=is_admin,
     )
@@ -52,6 +54,10 @@ class TestVideosUpload(BaseTestVideos):
         response = await request(
             "POST",
             self.method_url,
+            data={
+                "title": "Test clip",
+                "description": "A test upload",
+            },
             files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
         )
 
@@ -62,12 +68,18 @@ class TestVideosUpload(BaseTestVideos):
         assert response_data["content_type"] == "video/mp4"
         assert response_data["size_bytes"] == len(b"fake-video-bytes")
         assert response_data["author_id"] == 1
+        assert response_data["author_first_name"] == "Test"
+        assert response_data["author_last_name"] == "Author"
+        assert response_data["author_username"] == "user-1"
+        assert response_data["title"] == "Test clip"
+        assert response_data["description"] == "A test upload"
 
     async def test_upload_video_unauthorized(self):
         app.dependency_overrides.pop(get_current_user, None)
         response = await request(
             "POST",
             self.method_url,
+            data={"title": "Test clip"},
             files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
         )
 
@@ -77,6 +89,7 @@ class TestVideosUpload(BaseTestVideos):
         response = await request(
             "POST",
             self.method_url,
+            data={"title": "Notes"},
             files={"file": ("notes.txt", b"text", "text/plain")},
         )
 
@@ -90,6 +103,10 @@ class TestVideosRead(BaseTestVideos):
         response = await request(
             "POST",
             f"{self.method_url}/upload/",
+            data={
+                "title": "Test clip",
+                "description": "A test upload",
+            },
             files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
         )
         return response.json()
@@ -116,6 +133,37 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 200
         assert response.content == b"fake-video-bytes"
+
+    async def test_change_video_success(self):
+        video = await self.create_video()
+        response = await request(
+            "PATCH",
+            f"{self.method_url}/{video['id']}",
+            json={
+                "title": "Changed title",
+                "description": "Changed description",
+            },
+        )
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["title"] == "Changed title"
+        assert response_data["description"] == "Changed description"
+
+    async def test_change_video_forbidden_for_non_author(self):
+        video = await self.create_video()
+        set_current_user(user(user_id=2))
+
+        response = await request(
+            "PATCH",
+            f"{self.method_url}/{video['id']}",
+            json={
+                "title": "Changed title",
+                "description": "Changed description",
+            },
+        )
+
+        assert response.status_code == 403
 
     async def test_delete_video_success(self):
         video = await self.create_video()
