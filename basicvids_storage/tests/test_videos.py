@@ -165,13 +165,13 @@ class TestVideosUpload(BaseTestVideos):
 class TestVideosRead(BaseTestVideos):
     method_url = "/api/v1/videos"
 
-    async def create_video(self):
+    async def create_video(self, title: str = "Test clip", description: str = "A test upload"):
         response = await request(
             "POST",
             f"{self.method_url}/upload/",
             data={
-                "title": "Test clip",
-                "description": "A test upload",
+                "title": title,
+                "description": description,
             },
             files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
         )
@@ -185,6 +185,28 @@ class TestVideosRead(BaseTestVideos):
         response_data = response.json()
         assert response_data["count"] == 1
         assert VideoPublic(**response_data["videos"][0])
+
+    async def test_list_videos_searches_title_and_description_with_title_priority(self):
+        await self.create_video(title="Cooking basics", description="Intro lesson")
+        description_match = await self.create_video(title="Travel diary", description="Cooking on a mountain")
+        title_match = await self.create_video(title="Mountain cooking", description="Camp stove guide")
+
+        response = await request("GET", f"{self.method_url}/", params={"search": "cooking"})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 3
+        assert response_data["videos"][0]["id"] == title_match["id"]
+        assert response_data["videos"][1]["title"] == "Cooking basics"
+        assert response_data["videos"][2]["id"] == description_match["id"]
+
+    async def test_list_videos_search_returns_no_matches(self):
+        await self.create_video(title="Cooking basics", description="Intro lesson")
+
+        response = await request("GET", f"{self.method_url}/", params={"search": "missing"})
+
+        assert response.status_code == 200
+        assert response.json() == {"videos": [], "count": 0}
 
     async def test_get_video_success(self):
         video = await self.create_video()

@@ -3,6 +3,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from sqlalchemy import case, func, or_
 from sqlmodel import Session, col, select
 
 from basicvids_storage.auth import CurrentUser, get_current_user
@@ -133,9 +134,24 @@ async def set_video_thumbnail(
 async def list_videos(
     offset: int = 0,
     limit: int = Query(default=20, le=100),
+    search: str | None = Query(default=None, max_length=255),
     session: Session = Depends(get_session),
 ) -> VideoList:
-    statement = select(Video).order_by(col(Video.created_at).desc()).offset(offset).limit(limit)
+    statement = select(Video)
+    clean_search = search.strip() if search else ""
+
+    if clean_search:
+        search_pattern = f"%{clean_search.lower()}%"
+        title_match = func.lower(Video.title).like(search_pattern)
+        description_match = func.lower(func.coalesce(Video.description, "")).like(search_pattern)
+        statement = statement.where(or_(title_match, description_match)).order_by(
+            case((title_match, 0), else_=1),
+            col(Video.created_at).desc(),
+        )
+    else:
+        statement = statement.order_by(col(Video.created_at).desc())
+
+    statement = statement.offset(offset).limit(limit)
     videos = session.exec(statement).all()
     return VideoList(
         videos=[VideoPublic.model_validate(video) for video in videos],
