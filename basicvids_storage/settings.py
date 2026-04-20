@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     THUMBNAIL_WIDTH: int = Field(default=320, gt=0)
     THUMBNAIL_JPEG_QUALITY: int = Field(default=5, ge=2, le=31)
     THUMBNAIL_GENERATION_TIMEOUT_SECONDS: int = Field(default=20, gt=0)
+    VIDEO_TRANSCODE_MAX_HEIGHT: int = Field(default=1080, gt=0)
+    VIDEO_TRANSCODE_QUALITIES: str = "360,480,720,1080"
+    VIDEO_TRANSCODE_CRF: int = Field(default=28, ge=18, le=35)
+    VIDEO_TRANSCODE_TIMEOUT_SECONDS: int = Field(default=1800, gt=0)
     AUTH_CURRENT_USER_URL: str = "http://basicvids_auth:8000/api/v1/users/detail/"
 
     model_config = SettingsConfigDict(

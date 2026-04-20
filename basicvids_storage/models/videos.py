@@ -28,6 +28,22 @@ class Video(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class VideoVariant(SQLModel, table=True):
+    id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
+    video_id: str = Field(foreign_key="video.id", index=True)
+    quality: int = Field(gt=0, index=True)
+    storage_key: str = Field(unique=True, max_length=500)
+    content_type: str = Field(default="video/mp4", max_length=100)
+    size_bytes: int = Field(ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class VideoQualityPublic(BaseModel):
+    quality: int
+    label: str
+    size_bytes: int
+
+
 class VideoPublic(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -44,6 +60,7 @@ class VideoPublic(BaseModel):
     storage_backend: str
     thumbnail_storage_key: str | None = PydanticField(default=None, exclude=True)
     created_at: datetime
+    qualities: list[VideoQualityPublic] = PydanticField(default_factory=list)
 
     @computed_field
     @property

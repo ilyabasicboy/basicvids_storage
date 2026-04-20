@@ -6,8 +6,9 @@ import pytest
 
 from basicvids_storage.routers import videos as videos_router
 from basicvids_storage.auth import CurrentUser, get_current_user
-from basicvids_storage.models.videos import Video, VideoPublic
+from basicvids_storage.models.videos import Video, VideoPublic, VideoVariant
 from basicvids_storage.thumbnails import GeneratedThumbnail
+from basicvids_storage.transcoding import TranscodedVideoVariant
 from basicvids_storage.tests import app, engine, temporary_directory
 
 
@@ -39,9 +40,24 @@ def set_current_user(current_user: CurrentUser) -> None:
 
 
 class BaseTestVideos:
+    @pytest.fixture(autouse=True)
+    def mock_video_transcoding(self, monkeypatch):
+        async def generate_variants(video_path, storage, settings):
+            stored_object = storage.save_file(video_path, ".mp4", settings.MAX_UPLOAD_SIZE_BYTES)
+            return [
+                TranscodedVideoVariant(
+                    quality=1080,
+                    stored_object=stored_object,
+                    content_type="video/mp4",
+                )
+            ]
+
+        monkeypatch.setattr(videos_router, "generate_transcoded_video_variants", generate_variants)
+
     def setup_method(self):
         set_current_user(user())
         with Session(engine) as session:
+            session.exec(delete(VideoVariant))
             session.exec(delete(Video))
             session.commit()
         for path in Path(temporary_directory.name).iterdir():
@@ -76,6 +92,14 @@ class TestVideosUpload(BaseTestVideos):
         assert response_data["title"] == "Test clip"
         assert response_data["description"] == "A test upload"
         assert response_data["has_thumbnail"] is False
+        assert response_data["content_type"] == "video/mp4"
+        assert response_data["qualities"] == [
+            {
+                "quality": 1080,
+                "label": "1080p",
+                "size_bytes": len(b"fake-video-bytes"),
+            }
+        ]
 
     async def test_upload_video_with_thumbnail_success(self):
         response = await request(
@@ -258,6 +282,20 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 200
         assert response.content == b"fake-video-bytes"
+
+    async def test_download_video_quality_success(self):
+        video = await self.create_video()
+        response = await request("GET", f"{self.method_url}/{video['id']}/download/", params={"quality": 1080})
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "video/mp4"
+        assert response.content == b"fake-video-bytes"
+
+    async def test_download_video_quality_not_found(self):
+        video = await self.create_video()
+        response = await request("GET", f"{self.method_url}/{video['id']}/download/", params={"quality": 720})
+
+        assert response.status_code == 404
 
     async def test_download_video_thumbnail_success(self):
         response = await request(
