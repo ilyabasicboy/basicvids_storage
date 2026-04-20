@@ -186,6 +186,43 @@ class TestVideosRead(BaseTestVideos):
         assert response_data["count"] == 1
         assert VideoPublic(**response_data["videos"][0])
 
+    async def test_list_videos_paginates_with_maximum_page_size(self):
+        with Session(engine) as session:
+            for index in range(31):
+                session.add(
+                    Video(
+                        title=f"Video {index}",
+                        description=None,
+                        original_filename=f"clip-{index}.mp4",
+                        content_type="video/mp4",
+                        size_bytes=10,
+                        author_id=1,
+                        author_username="user-1",
+                        storage_backend="disk",
+                        storage_key=f"video-{index}",
+                    )
+                )
+            session.commit()
+
+        response = await request("GET", f"{self.method_url}/")
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 31
+        assert len(response_data["videos"]) == 30
+
+        response = await request("GET", f"{self.method_url}/", params={"offset": 30, "limit": 30})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 31
+        assert len(response_data["videos"]) == 1
+
+    async def test_list_videos_rejects_page_size_over_30(self):
+        response = await request("GET", f"{self.method_url}/", params={"limit": 31})
+
+        assert response.status_code == 422
+
     async def test_list_videos_searches_title_and_description_with_title_priority(self):
         await self.create_video(title="Cooking basics", description="Intro lesson")
         description_match = await self.create_video(title="Travel diary", description="Cooking on a mountain")

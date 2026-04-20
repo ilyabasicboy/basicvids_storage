@@ -132,30 +132,34 @@ async def set_video_thumbnail(
 
 @router.get("/", response_model=VideoList)
 async def list_videos(
-    offset: int = 0,
-    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=30, ge=1, le=30),
     search: str | None = Query(default=None, max_length=255),
     session: Session = Depends(get_session),
 ) -> VideoList:
     statement = select(Video)
+    count_statement = select(func.count()).select_from(Video)
     clean_search = search.strip() if search else ""
 
     if clean_search:
         search_pattern = f"%{clean_search.lower()}%"
         title_match = func.lower(Video.title).like(search_pattern)
         description_match = func.lower(func.coalesce(Video.description, "")).like(search_pattern)
+        filters = or_(title_match, description_match)
         statement = statement.where(or_(title_match, description_match)).order_by(
             case((title_match, 0), else_=1),
             col(Video.created_at).desc(),
         )
+        count_statement = count_statement.where(filters)
     else:
         statement = statement.order_by(col(Video.created_at).desc())
 
     statement = statement.offset(offset).limit(limit)
     videos = session.exec(statement).all()
+    total_count = session.exec(count_statement).one()
     return VideoList(
         videos=[VideoPublic.model_validate(video) for video in videos],
-        count=len(videos),
+        count=total_count,
     )
 
 
