@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 
 from sqlmodel import Session, delete
@@ -7,9 +8,13 @@ import pytest
 from basicvids_storage.routers import videos as videos_router
 from basicvids_storage.auth import CurrentUser, get_current_user
 from basicvids_storage.models.videos import Video, VideoPublic, VideoVariant
+from basicvids_storage import tasks as video_tasks
+from basicvids_storage.tasks import process_video_async
 from basicvids_storage.thumbnails import GeneratedThumbnail
 from basicvids_storage.transcoding import TranscodedVideoVariant
 from basicvids_storage.tests import app, engine, temporary_directory
+from basicvids_storage.storage.disk import DiskStorage
+from basicvids_storage.models.videos import utc_now
 
 
 pytestmark = pytest.mark.anyio
@@ -41,7 +46,7 @@ def set_current_user(current_user: CurrentUser) -> None:
 
 class BaseTestVideos:
     @pytest.fixture(autouse=True)
-    def mock_video_transcoding(self, monkeypatch):
+    def mock_background_processing(self, monkeypatch):
         async def generate_variants(video_path, storage, settings):
             stored_object = storage.save_file(video_path, ".mp4", settings.MAX_UPLOAD_SIZE_BYTES)
             return [
@@ -52,7 +57,11 @@ class BaseTestVideos:
                 )
             ]
 
-        monkeypatch.setattr(videos_router, "generate_transcoded_video_variants", generate_variants)
+        monkeypatch.setattr(video_tasks, "generate_transcoded_video_variants", generate_variants)
+        monkeypatch.setattr(video_tasks, "engine", engine)
+        monkeypatch.setattr(video_tasks, "build_storage", lambda: DiskStorage(root_path=temporary_directory.name))
+
+        monkeypatch.setattr(videos_router, "enqueue_video_processing", lambda _video_id: None)
 
     def setup_method(self):
         set_current_user(user())
@@ -92,14 +101,8 @@ class TestVideosUpload(BaseTestVideos):
         assert response_data["title"] == "Test clip"
         assert response_data["description"] == "A test upload"
         assert response_data["has_thumbnail"] is False
-        assert response_data["content_type"] == "video/mp4"
-        assert response_data["qualities"] == [
-            {
-                "quality": 1080,
-                "label": "1080p",
-                "size_bytes": len(b"fake-video-bytes"),
-            }
-        ]
+        assert response_data["status"] == "processing"
+        assert response_data["qualities"] == []
 
     async def test_upload_video_with_thumbnail_success(self):
         response = await request(
@@ -129,7 +132,7 @@ class TestVideosUpload(BaseTestVideos):
                 content_type="image/jpeg",
             )
 
-        monkeypatch.setattr(videos_router, "generate_video_thumbnail", generate_thumbnail)
+        monkeypatch.setattr(video_tasks, "generate_video_thumbnail", generate_thumbnail)
 
         response = await request(
             "POST",
@@ -142,6 +145,11 @@ class TestVideosUpload(BaseTestVideos):
         )
 
         assert response.status_code == 201
+        response_data = response.json()
+        assert response_data["status"] == "processing"
+        await process_video_async(response_data["id"])
+
+        response = await request("GET", f"/api/v1/videos/{response_data['id']}")
         response_data = response.json()
         assert response_data["has_thumbnail"] is True
 
@@ -199,6 +207,9 @@ class TestVideosRead(BaseTestVideos):
             },
             files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
         )
+        video = response.json()
+        await process_video_async(video["id"])
+        response = await request("GET", f"{self.method_url}/{video['id']}")
         return response.json()
 
     async def test_list_videos_success(self):
@@ -268,6 +279,28 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 200
         assert response.json() == {"videos": [], "count": 0}
+
+    async def test_get_video_marks_stale_processing_as_failed(self):
+        response = await request(
+            "POST",
+            f"{self.method_url}/upload/",
+            data={"title": "Stuck clip"},
+            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+        )
+        video = response.json()
+
+        with Session(engine) as session:
+            stored_video = session.get(Video, video["id"])
+            stored_video.created_at = utc_now() - timedelta(seconds=4000)
+            session.add(stored_video)
+            session.commit()
+
+        response = await request("GET", f"{self.method_url}/{video['id']}")
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["status"] == "failed"
+        assert response_data["processing_error"] == "Video processing timed out"
 
     async def test_get_video_success(self):
         video = await self.create_video()

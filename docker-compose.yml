@@ -29,6 +29,25 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  basicvids_storage_worker:
+    image: ilyabasicboy/basicvids-storage:latest
+    build: .
+    container_name: basicvids_storage_worker
+    volumes:
+      - ${DATA_PATH:-./data}:/basicvids_storage/data
+    environment:
+      PYTHONDONTWRITEBYTECODE: 1
+      PYTHONUNBUFFERED: 1
+    entrypoint: ["/basicvids_storage/worker-entrypoint.sh"]
+    networks:
+      - basicvids
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 networks:
   basicvids:
     external: true

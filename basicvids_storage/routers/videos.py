@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Annotated
 from urllib.parse import quote
 
@@ -16,12 +17,12 @@ from basicvids_storage.models.videos import (
     VideoPublic,
     VideoQualityPublic,
     VideoVariant,
+    utc_now,
 )
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
-from basicvids_storage.thumbnails import generate_video_thumbnail
-from basicvids_storage.transcoding import generate_transcoded_video_variants
+from basicvids_storage.tasks import enqueue_video_processing
 
 
 router = APIRouter(tags=["Videos"], prefix="/videos")
@@ -54,6 +55,28 @@ def get_video_variants(session: Session, video_id: str) -> list[VideoVariant]:
     return session.exec(select(VideoVariant).where(VideoVariant.video_id == video_id).order_by(col(VideoVariant.quality))).all()
 
 
+def mark_stale_processing_videos(session: Session, videos: list[Video]) -> None:
+    now = utc_now()
+    updated = False
+    for video in videos:
+        if video.status != "processing":
+            continue
+        comparison_now = now if video.created_at.tzinfo else now.replace(tzinfo=None)
+        if video.created_at + timedelta(seconds=settings.VIDEO_PROCESSING_STALE_AFTER_SECONDS) > comparison_now:
+            continue
+
+        video.status = "failed"
+        video.processing_error = "Video processing timed out"
+        session.add(video)
+        updated = True
+
+    if updated:
+        session.commit()
+        for video in videos:
+            if video.id:
+                session.refresh(video)
+
+
 @router.post("/upload/", response_model=VideoPublic, status_code=201)
 async def upload_video(
     file: Annotated[UploadFile, File()],
@@ -73,67 +96,39 @@ async def upload_video(
 
     stored_object = None
     stored_thumbnail = None
-    stored_variants = []
     try:
         stored_object = await storage.save_upload(file, settings.MAX_UPLOAD_SIZE_BYTES)
-        transcoded_variants = await generate_transcoded_video_variants(storage.path_for(stored_object.key), storage, settings)
-        if not transcoded_variants:
-            raise HTTPException(status_code=422, detail="Video transcoding failed")
-        stored_variants = [variant.stored_object for variant in transcoded_variants]
-
         if thumbnail:
             stored_thumbnail = await storage.save_upload(thumbnail, settings.MAX_THUMBNAIL_SIZE_BYTES)
-            thumbnail_content_type = thumbnail.content_type
-        else:
-            generated_thumbnail = await generate_video_thumbnail(storage.path_for(stored_object.key), storage, settings)
-            if generated_thumbnail:
-                stored_thumbnail = generated_thumbnail.stored_object
-                thumbnail_content_type = generated_thumbnail.content_type
-            else:
-                thumbnail_content_type = None
-
-        primary_variant = max(transcoded_variants, key=lambda item: item.quality)
         video = Video(
             title=clean_title,
             description=description.strip() if description else None,
             original_filename=file.filename,
-            content_type=primary_variant.content_type,
-            size_bytes=sum(variant.stored_object.size_bytes for variant in transcoded_variants),
+            content_type=file.content_type,
+            size_bytes=stored_object.size_bytes,
             author_id=current_user.id,
             author_username=current_user.username,
             author_first_name=current_user.first_name,
             author_last_name=current_user.last_name,
             storage_backend=storage.name,
-            storage_key=primary_variant.stored_object.key,
+            storage_key=stored_object.key,
             thumbnail_storage_key=stored_thumbnail.key if stored_thumbnail else None,
-            thumbnail_content_type=thumbnail_content_type if stored_thumbnail else None,
+            thumbnail_content_type=thumbnail.content_type if stored_thumbnail else None,
             thumbnail_size_bytes=stored_thumbnail.size_bytes if stored_thumbnail else None,
+            status="processing",
         )
 
         session.add(video)
-        session.flush()
-        for transcoded_variant in transcoded_variants:
-            session.add(
-                VideoVariant(
-                    video_id=video.id,
-                    quality=transcoded_variant.quality,
-                    storage_key=transcoded_variant.stored_object.key,
-                    content_type=transcoded_variant.content_type,
-                    size_bytes=transcoded_variant.stored_object.size_bytes,
-                )
-            )
         session.commit()
     except Exception:
         session.rollback()
-        for stored_variant in stored_variants:
-            storage.delete(stored_variant.key)
         if stored_thumbnail:
             storage.delete(stored_thumbnail.key)
         if stored_object:
             storage.delete(stored_object.key)
         raise
 
-    storage.delete(stored_object.key)
+    enqueue_video_processing(video.id)
     session.refresh(video)
     return to_video_public(video, get_video_variants(session, video.id))
 
@@ -150,6 +145,8 @@ async def set_video_thumbnail(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    if video.status != "ready":
+        raise HTTPException(status_code=409, detail="Video is still processing")
     if video.author_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Only the author or an admin can change this video")
 
@@ -199,6 +196,7 @@ async def list_videos(
 
     statement = statement.offset(offset).limit(limit)
     videos = session.exec(statement).all()
+    mark_stale_processing_videos(session, videos)
     total_count = session.exec(count_statement).one()
     video_ids = [video.id for video in videos]
     variants_by_video_id = {video_id: [] for video_id in video_ids}
@@ -220,6 +218,7 @@ async def get_video(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
     return to_video_public(video, get_video_variants(session, video.id))
 
 
@@ -233,6 +232,9 @@ async def download_video(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
+    if video.status != "ready":
+        raise HTTPException(status_code=409, detail="Video is still processing")
 
     variants = get_video_variants(session, video.id)
     selected_variant = None
@@ -272,6 +274,7 @@ async def download_video_thumbnail(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
     if not video.thumbnail_storage_key:
         raise HTTPException(status_code=404, detail="Video thumbnail not found")
 
@@ -300,8 +303,11 @@ async def change_video(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
     if video.author_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Only the author or an admin can change this video")
+    if video.status != "ready":
+        raise HTTPException(status_code=409, detail="Video is still processing")
 
     clean_title = data.title.strip()
     if not clean_title:
@@ -325,6 +331,7 @@ async def delete_video(
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
     if video.author_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Only the author or an admin can delete this video")
 

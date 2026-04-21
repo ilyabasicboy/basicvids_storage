@@ -25,6 +25,8 @@ class Video(SQLModel, table=True):
     thumbnail_storage_key: str | None = Field(default=None, max_length=500)
     thumbnail_content_type: str | None = Field(default=None, max_length=100)
     thumbnail_size_bytes: int | None = Field(default=None, ge=0)
+    status: str = Field(default="processing", max_length=20, index=True)
+    processing_error: str | None = Field(default=None, max_length=2000)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -58,6 +60,8 @@ class VideoPublic(BaseModel):
     author_first_name: str | None = None
     author_last_name: str | None = None
     storage_backend: str
+    status: str
+    processing_error: str | None = None
     thumbnail_storage_key: str | None = PydanticField(default=None, exclude=True)
     created_at: datetime
     qualities: list[VideoQualityPublic] = PydanticField(default_factory=list)

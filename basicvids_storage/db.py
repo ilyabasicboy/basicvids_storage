@@ -12,6 +12,7 @@ def create_db_and_tables():
     settings.video_storage_path.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(engine)
     migrate_video_columns()
+    migrate_video_variant_table()
 
 
 def migrate_video_columns():
@@ -39,6 +40,23 @@ def migrate_video_columns():
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_content_type VARCHAR(100)"))
         if "thumbnail_size_bytes" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_size_bytes INTEGER"))
+        if "status" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN status VARCHAR(20) DEFAULT 'ready' NOT NULL"))
+        if "processing_error" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN processing_error VARCHAR(2000)"))
+
+
+def migrate_video_variant_table():
+    inspector = inspect(engine)
+    if "video_variant" in inspector.get_table_names():
+        return
+
+    video_variant_table = SQLModel.metadata.tables.get("video_variant")
+    if video_variant_table is None:
+        return
+
+    with engine.begin() as connection:
+        video_variant_table.create(connection, checkfirst=True)
 
 
 async def get_session():

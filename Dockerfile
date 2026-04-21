@@ -27,5 +27,6 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 
 RUN chmod +x entrypoint.sh
+RUN chmod +x worker-entrypoint.sh
 
 ENTRYPOINT ["/basicvids_storage/entrypoint.sh"]

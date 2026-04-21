@@ -67,6 +67,8 @@ async def _transcode_video(input_path: Path, output_path: Path, quality: int, se
         f"scale=-2:'min({quality},ih)'",
         "-c:v",
         "libx264",
+        "-threads",
+        str(settings.VIDEO_TRANSCODE_THREADS),
         "-preset",
         "veryfast",
         "-crf",
