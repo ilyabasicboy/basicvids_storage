@@ -40,6 +40,8 @@ def migrate_video_columns():
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_content_type VARCHAR(100)"))
         if "thumbnail_size_bytes" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_size_bytes INTEGER"))
+        if "duration_seconds" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN duration_seconds FLOAT"))
         if "status" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN status VARCHAR(20) DEFAULT 'ready' NOT NULL"))
         if "processing_error" not in columns:

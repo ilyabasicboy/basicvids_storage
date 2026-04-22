@@ -47,6 +47,12 @@ def set_current_user(current_user: CurrentUser) -> None:
 class BaseTestVideos:
     @pytest.fixture(autouse=True)
     def mock_background_processing(self, monkeypatch):
+        async def probe_duration(_video_path, _timeout):
+            return 125.0
+
+        async def generate_thumbnail(_video_path, _storage, _settings):
+            return None
+
         async def generate_variants(video_path, storage, settings):
             stored_object = storage.save_file(video_path, ".mp4", settings.MAX_UPLOAD_SIZE_BYTES)
             return [
@@ -58,6 +64,8 @@ class BaseTestVideos:
             ]
 
         monkeypatch.setattr(video_tasks, "generate_transcoded_video_variants", generate_variants)
+        monkeypatch.setattr(video_tasks, "probe_video_duration", probe_duration)
+        monkeypatch.setattr(video_tasks, "generate_video_thumbnail", generate_thumbnail)
         monkeypatch.setattr(video_tasks, "engine", engine)
         monkeypatch.setattr(video_tasks, "build_storage", lambda: DiskStorage(root_path=temporary_directory.name))
 
@@ -280,6 +288,19 @@ class TestVideosRead(BaseTestVideos):
         assert response.status_code == 200
         assert response.json() == {"videos": [], "count": 0}
 
+    async def test_list_videos_filters_by_author_id(self):
+        await self.create_video(title="User one video")
+        set_current_user(user(user_id=2))
+        await self.create_video(title="User two video")
+        set_current_user(user())
+
+        response = await request("GET", f"{self.method_url}/", params={"author_id": 2})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 1
+        assert response_data["videos"][0]["author_id"] == 2
+
     async def test_get_video_marks_stale_processing_as_failed(self):
         response = await request(
             "POST",
@@ -308,6 +329,7 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 200
         assert response.json()["id"] == video["id"]
+        assert response.json()["duration_seconds"] == 125.0
 
     async def test_download_video_success(self):
         video = await self.create_video()

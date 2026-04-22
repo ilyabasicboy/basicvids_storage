@@ -175,11 +175,17 @@ async def list_videos(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=30, ge=1, le=30),
     search: str | None = Query(default=None, max_length=255),
+    author_id: int | None = Query(default=None, ge=1),
     session: Session = Depends(get_session),
 ) -> VideoList:
     statement = select(Video)
     count_statement = select(func.count()).select_from(Video)
     clean_search = search.strip() if search else ""
+
+    if author_id is not None:
+        author_filter = Video.author_id == author_id
+        statement = statement.where(author_filter)
+        count_statement = count_statement.where(author_filter)
 
     if clean_search:
         search_pattern = f"%{clean_search.lower()}%"

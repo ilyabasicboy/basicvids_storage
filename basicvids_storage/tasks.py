@@ -8,7 +8,7 @@ from basicvids_storage.db import engine
 from basicvids_storage.models.videos import Video, VideoVariant
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import build_storage
-from basicvids_storage.thumbnails import generate_video_thumbnail
+from basicvids_storage.thumbnails import generate_video_thumbnail, probe_video_duration
 from basicvids_storage.transcoding import generate_transcoded_video_variants
 
 
@@ -32,6 +32,7 @@ async def process_video_async(video_id: str) -> None:
     stored_variant_keys = []
     stored_thumbnail_key = None
     try:
+        duration_seconds = await probe_video_duration(source_path, settings.THUMBNAIL_GENERATION_TIMEOUT_SECONDS)
         transcoded_variants = await generate_transcoded_video_variants(source_path, storage, settings)
         if not transcoded_variants:
             raise RuntimeError("Video transcoding failed")
@@ -73,6 +74,7 @@ async def process_video_async(video_id: str) -> None:
             video.storage_key = primary_variant.stored_object.key
             video.content_type = primary_variant.content_type
             video.size_bytes = sum(variant.stored_object.size_bytes for variant in transcoded_variants)
+            video.duration_seconds = duration_seconds
             video.thumbnail_storage_key = stored_thumbnail_key
             video.thumbnail_content_type = generated_thumbnail.content_type if generated_thumbnail else None
             video.thumbnail_size_bytes = generated_thumbnail.stored_object.size_bytes if generated_thumbnail else None

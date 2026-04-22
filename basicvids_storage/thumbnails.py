@@ -38,7 +38,7 @@ async def _run_command(*args: str, timeout: int) -> tuple[int, str, str]:
     )
 
 
-async def _probe_duration(video_path: Path, timeout: int) -> float | None:
+async def probe_video_duration(video_path: Path, timeout: int) -> float | None:
     returncode, stdout, _stderr = await _run_command(
         "ffprobe",
         "-v",
@@ -86,7 +86,7 @@ async def generate_video_thumbnail(
     storage: StorageBackend,
     settings: Settings,
 ) -> GeneratedThumbnail | None:
-    duration = await _probe_duration(video_path, settings.THUMBNAIL_GENERATION_TIMEOUT_SECONDS)
+    duration = await probe_video_duration(video_path, settings.THUMBNAIL_GENERATION_TIMEOUT_SECONDS)
     seek_points = []
     if duration:
         seek_points.append(max(duration / 2, 0))
