@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     VIDEO_PROCESSING_STALE_AFTER_SECONDS: int = Field(default=1800, gt=0)
     CELERY_BROKER_URL: str = "redis://basicvids_redis:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://basicvids_redis:6379/1"
+    REDIS_URL: str = "redis://localhost:6379/2"
     CELERY_TASK_ALWAYS_EAGER: bool = False
     VIDEO_TRANSCODE_QUEUE: str = "video_transcode"
     VIDEO_TRANSCODE_WORKER_CONCURRENCY: int = Field(default=1, ge=1, le=8)

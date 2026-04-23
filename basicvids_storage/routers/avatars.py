@@ -1,12 +1,13 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
 from basicvids_storage.auth import CurrentUser, get_current_user
 from basicvids_storage.db import get_session
 from basicvids_storage.models.avatars import Avatar, AvatarDeleteResponse, AvatarPublic, utc_now
+from basicvids_storage.rate_limit import client_identifier, enforce_rate_limit
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
@@ -74,10 +75,12 @@ async def save_avatar(
 @router.post("/users/{user_id}/registration/", response_model=AvatarPublic, status_code=201)
 async def create_registration_avatar(
     user_id: int,
+    request: Request,
     avatar: Annotated[UploadFile, File()],
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
 ) -> Avatar:
+    await enforce_rate_limit("registration_avatar_ip", client_identifier(request), 10, 3600)
     return await save_avatar(
         user_id=user_id,
         avatar_file=avatar,
@@ -89,11 +92,13 @@ async def create_registration_avatar(
 
 @router.put("/me/", response_model=AvatarPublic)
 async def set_current_user_avatar(
+    request: Request,
     avatar: Annotated[UploadFile, File()],
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> Avatar:
+    await enforce_rate_limit("avatar_upload_user", f"user:{current_user.id}", 20, 3600)
     return await save_avatar(
         user_id=current_user.id,
         avatar_file=avatar,

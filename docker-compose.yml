@@ -8,6 +8,7 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: 1
       PYTHONUNBUFFERED: 1
+      REDIS_URL: redis://basicvids_redis:6379/2
     entrypoint: ["/basicvids_storage/entrypoint.sh"]
     expose:
       - "8000"
@@ -38,6 +39,7 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: 1
       PYTHONUNBUFFERED: 1
+      REDIS_URL: redis://basicvids_redis:6379/2
     entrypoint: ["/basicvids_storage/worker-entrypoint.sh"]
     networks:
       - basicvids

@@ -2,7 +2,7 @@ from datetime import timedelta
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, or_
 from sqlmodel import Session, col, select
@@ -19,6 +19,7 @@ from basicvids_storage.models.videos import (
     VideoVariant,
     utc_now,
 )
+from basicvids_storage.rate_limit import client_identifier, enforce_rate_limit
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
@@ -79,6 +80,7 @@ def mark_stale_processing_videos(session: Session, videos: list[Video]) -> None:
 
 @router.post("/upload/", response_model=VideoPublic, status_code=201)
 async def upload_video(
+    request: Request,
     file: Annotated[UploadFile, File()],
     title: Annotated[str, Form()],
     description: Annotated[str | None, Form()] = None,
@@ -87,6 +89,8 @@ async def upload_video(
     storage: StorageBackend = Depends(get_storage),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> VideoPublic:
+    await enforce_rate_limit("upload_video_ip", client_identifier(request), 20, 3600)
+    await enforce_rate_limit("upload_video_user", f"user:{current_user.id}", 5, 3600)
     validate_video_upload(file)
     if thumbnail:
         validate_thumbnail_upload(thumbnail)
@@ -136,11 +140,13 @@ async def upload_video(
 @router.put("/{video_id}/thumbnail/", response_model=VideoPublic)
 async def set_video_thumbnail(
     video_id: str,
+    request: Request,
     thumbnail: Annotated[UploadFile, File()],
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> VideoPublic:
+    await enforce_rate_limit("upload_thumbnail_user", f"user:{current_user.id}", 20, 3600)
     validate_thumbnail_upload(thumbnail)
     video = session.get(Video, video_id)
     if not video:
@@ -231,10 +237,12 @@ async def get_video(
 @router.get("/{video_id}/download/")
 async def download_video(
     video_id: str,
+    request: Request,
     quality: int | None = Query(default=None, gt=0),
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
 ) -> StreamingResponse:
+    await enforce_rate_limit("download_video_ip", client_identifier(request), 600, 60)
     video = session.get(Video, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
