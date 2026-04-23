@@ -76,7 +76,12 @@ Project environment can be placed in:
 
 ### Videos
 
-- **POST** `/api/v1/videos/upload/`
+- **POST** `/api/v1/videos/uploads/`
+  - Create resumable upload session
+- **PUT** `/api/v1/videos/uploads/{upload_id}/chunks/{chunk_index}`
+  - Upload chunk
+- **POST** `/api/v1/videos/uploads/{upload_id}/complete/`
+  - Finalize resumable upload and create video
   - **Requires:** authentication
   - **Form fields:** `file`, `title`, `description` optional
   - **Accepts:** `video/*`

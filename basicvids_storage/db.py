@@ -10,9 +10,11 @@ engine = create_engine(settings.DATABASE_URL)
 def create_db_and_tables():
     settings.DATA_PATH.mkdir(parents=True, exist_ok=True)
     settings.video_storage_path.mkdir(parents=True, exist_ok=True)
+    settings.resumable_upload_path.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(engine)
     migrate_video_columns()
     migrate_video_variant_table()
+    migrate_video_upload_session_table()
 
 
 def migrate_video_columns():
@@ -42,6 +44,10 @@ def migrate_video_columns():
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_size_bytes INTEGER"))
         if "duration_seconds" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN duration_seconds FLOAT"))
+        if "hls_storage_prefix" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN hls_storage_prefix VARCHAR(500)"))
+        if "hls_manifest_storage_key" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN hls_manifest_storage_key VARCHAR(500)"))
         if "status" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN status VARCHAR(20) DEFAULT 'ready' NOT NULL"))
         if "processing_error" not in columns:
@@ -59,6 +65,19 @@ def migrate_video_variant_table():
 
     with engine.begin() as connection:
         video_variant_table.create(connection, checkfirst=True)
+
+
+def migrate_video_upload_session_table():
+    inspector = inspect(engine)
+    if "videouploadsession" in inspector.get_table_names():
+        return
+
+    upload_session_table = SQLModel.metadata.tables.get("videouploadsession")
+    if upload_session_table is None:
+        return
+
+    with engine.begin() as connection:
+        upload_session_table.create(connection, checkfirst=True)
 
 
 async def get_session():

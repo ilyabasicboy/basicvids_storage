@@ -1,8 +1,12 @@
 from datetime import timedelta
+import math
+import shutil
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, or_
 from sqlmodel import Session, col, select
@@ -16,6 +20,9 @@ from basicvids_storage.models.videos import (
     VideoList,
     VideoPublic,
     VideoQualityPublic,
+    VideoUploadSession,
+    VideoUploadSessionCreate,
+    VideoUploadSessionPublic,
     VideoVariant,
     utc_now,
 )
@@ -29,18 +36,59 @@ from basicvids_storage.tasks import enqueue_video_processing
 router = APIRouter(tags=["Videos"], prefix="/videos")
 
 
-def validate_video_upload(file: UploadFile) -> None:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename is required")
-    if not file.content_type or not file.content_type.startswith("video/"):
-        raise HTTPException(status_code=415, detail="Only video uploads are supported")
-
-
 def validate_thumbnail_upload(file: UploadFile) -> None:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Thumbnail filename is required")
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="Only image thumbnails are supported")
+
+
+def validate_upload_session_payload(data: VideoUploadSessionCreate) -> None:
+    if not data.original_filename.strip():
+        raise HTTPException(status_code=400, detail="Filename is required")
+    if not data.content_type or not data.content_type.startswith("video/"):
+        raise HTTPException(status_code=415, detail="Only video uploads are supported")
+    if data.total_size_bytes > settings.MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="Upload is too large")
+    if data.chunk_size_bytes and data.chunk_size_bytes > settings.MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="Chunk size is too large")
+
+
+def create_video_record(
+    *,
+    title: str,
+    description: str | None,
+    original_filename: str,
+    content_type: str,
+    size_bytes: int,
+    storage_backend: str,
+    storage_key: str,
+    current_user: CurrentUser,
+    thumbnail_storage_key: str | None = None,
+    thumbnail_content_type: str | None = None,
+    thumbnail_size_bytes: int | None = None,
+) -> Video:
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Title is required")
+
+    return Video(
+        title=clean_title,
+        description=description.strip() if description else None,
+        original_filename=original_filename,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        author_id=current_user.id,
+        author_username=current_user.username,
+        author_first_name=current_user.first_name,
+        author_last_name=current_user.last_name,
+        storage_backend=storage_backend,
+        storage_key=storage_key,
+        thumbnail_storage_key=thumbnail_storage_key,
+        thumbnail_content_type=thumbnail_content_type,
+        thumbnail_size_bytes=thumbnail_size_bytes,
+        status="processing",
+    )
 
 
 def to_video_public(video: Video, variants: list[VideoVariant] | None = None) -> VideoPublic:
@@ -54,6 +102,25 @@ def to_video_public(video: Video, variants: list[VideoVariant] | None = None) ->
 
 def get_video_variants(session: Session, video_id: str) -> list[VideoVariant]:
     return session.exec(select(VideoVariant).where(VideoVariant.video_id == video_id).order_by(col(VideoVariant.quality))).all()
+
+
+def hls_media_type(storage_key: str) -> str:
+    if storage_key.endswith(".m3u8"):
+        return "application/vnd.apple.mpegurl"
+    if storage_key.endswith(".ts"):
+        return "video/mp2t"
+    return "application/octet-stream"
+
+
+def safe_hls_asset_key(video: Video, asset_path: str) -> str:
+    if not video.hls_storage_prefix:
+        raise HTTPException(status_code=404, detail="HLS stream not found")
+
+    path = PurePosixPath(asset_path)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise HTTPException(status_code=400, detail="Invalid HLS asset path")
+
+    return f"{video.hls_storage_prefix}/{path.as_posix()}"
 
 
 def mark_stale_processing_videos(session: Session, videos: list[Video]) -> None:
@@ -78,63 +145,236 @@ def mark_stale_processing_videos(session: Session, videos: list[Video]) -> None:
                 session.refresh(video)
 
 
-@router.post("/upload/", response_model=VideoPublic, status_code=201)
-async def upload_video(
+def get_upload_session(session: Session, upload_id: str) -> VideoUploadSession:
+    upload_session = session.get(VideoUploadSession, upload_id)
+    if not upload_session:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    return upload_session
+
+
+def ensure_upload_session_access(upload_session: VideoUploadSession, current_user: CurrentUser) -> None:
+    if upload_session.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the author or an admin can access this upload")
+
+
+def upload_session_path(upload_id: str) -> PurePosixPath:
+    return PurePosixPath(upload_id)
+
+
+def upload_session_root(upload_id: str):
+    path = settings.resumable_upload_path / upload_session_path(upload_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def upload_chunk_path(upload_id: str, chunk_index: int):
+    if chunk_index < 0:
+        raise HTTPException(status_code=400, detail="Chunk index must be non-negative")
+    return upload_session_root(upload_id) / f"{chunk_index:08d}.part"
+
+
+def list_received_chunks(upload_session: VideoUploadSession) -> list[int]:
+    root = settings.resumable_upload_path / upload_session_path(upload_session.id)
+    if not root.exists():
+        return []
+
+    chunks = []
+    for chunk_path in sorted(root.glob("*.part")):
+        try:
+            chunks.append(int(chunk_path.stem))
+        except ValueError:
+            continue
+    return chunks
+
+
+def upload_session_progress(upload_session: VideoUploadSession) -> tuple[list[int], int, int, bool]:
+    chunks = list_received_chunks(upload_session)
+    received_size = sum(upload_chunk_path(upload_session.id, chunk_index).stat().st_size for chunk_index in chunks)
+    total_chunks = math.ceil(upload_session.total_size_bytes / upload_session.chunk_size_bytes)
+    is_complete = len(chunks) == total_chunks and received_size == upload_session.total_size_bytes
+    return chunks, received_size, total_chunks, is_complete
+
+
+def to_upload_session_public(upload_session: VideoUploadSession) -> VideoUploadSessionPublic:
+    received_chunks, received_size_bytes, total_chunks, is_complete = upload_session_progress(upload_session)
+    public_session = VideoUploadSessionPublic.model_validate(upload_session)
+    public_session.received_chunks = received_chunks
+    public_session.received_size_bytes = received_size_bytes
+    public_session.total_chunks = total_chunks
+    public_session.is_complete = is_complete
+    return public_session
+
+
+def cleanup_upload_session_files(upload_id: str) -> None:
+    path = settings.resumable_upload_path / upload_session_path(upload_id)
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def expected_chunk_size(upload_session: VideoUploadSession, chunk_index: int) -> int:
+    total_chunks = math.ceil(upload_session.total_size_bytes / upload_session.chunk_size_bytes)
+    if chunk_index >= total_chunks:
+        raise HTTPException(status_code=400, detail="Chunk index is out of range")
+    if chunk_index == total_chunks - 1:
+        remainder = upload_session.total_size_bytes % upload_session.chunk_size_bytes
+        return remainder or upload_session.chunk_size_bytes
+    return upload_session.chunk_size_bytes
+
+
+@router.post("/uploads/", response_model=VideoUploadSessionPublic, status_code=201)
+async def create_upload_session(
     request: Request,
-    file: Annotated[UploadFile, File()],
-    title: Annotated[str, Form()],
-    description: Annotated[str | None, Form()] = None,
-    thumbnail: Annotated[UploadFile | None, File()] = None,
+    data: Annotated[VideoUploadSessionCreate, Body()],
+    session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> VideoUploadSessionPublic:
+    await enforce_rate_limit("upload_video_ip", client_identifier(request), 20, 3600)
+    await enforce_rate_limit("upload_video_user", f"user:{current_user.id}", 5, 3600)
+    validate_upload_session_payload(data)
+
+    chunk_size_bytes = min(
+        data.chunk_size_bytes or settings.VIDEO_UPLOAD_CHUNK_SIZE_BYTES,
+        settings.VIDEO_UPLOAD_CHUNK_SIZE_BYTES,
+    )
+    upload_session = VideoUploadSession(
+        title=data.title.strip(),
+        description=data.description.strip() if data.description else None,
+        original_filename=data.original_filename.strip(),
+        content_type=data.content_type,
+        total_size_bytes=data.total_size_bytes,
+        chunk_size_bytes=chunk_size_bytes,
+        author_id=current_user.id,
+        author_username=current_user.username,
+        author_first_name=current_user.first_name,
+        author_last_name=current_user.last_name,
+    )
+    if not upload_session.title:
+        raise HTTPException(status_code=400, detail="Title is required")
+
+    session.add(upload_session)
+    session.commit()
+    session.refresh(upload_session)
+    upload_session_root(upload_session.id)
+    return to_upload_session_public(upload_session)
+
+
+@router.get("/uploads/{upload_id}", response_model=VideoUploadSessionPublic)
+async def get_upload_session_status(
+    upload_id: str,
+    session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> VideoUploadSessionPublic:
+    upload_session = get_upload_session(session, upload_id)
+    ensure_upload_session_access(upload_session, current_user)
+    return to_upload_session_public(upload_session)
+
+
+@router.put("/uploads/{upload_id}/chunks/{chunk_index}", response_model=VideoUploadSessionPublic)
+async def upload_video_chunk(
+    upload_id: str,
+    chunk_index: int,
+    request: Request,
+    session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> VideoUploadSessionPublic:
+    upload_session = get_upload_session(session, upload_id)
+    ensure_upload_session_access(upload_session, current_user)
+    if upload_session.status != "uploading":
+        raise HTTPException(status_code=409, detail="Upload session is not accepting new chunks")
+
+    chunk_bytes = await request.body()
+    if not chunk_bytes:
+        raise HTTPException(status_code=400, detail="Chunk payload is required")
+
+    required_chunk_size = expected_chunk_size(upload_session, chunk_index)
+    if len(chunk_bytes) != required_chunk_size:
+        raise HTTPException(status_code=400, detail="Chunk size does not match upload session")
+
+    chunk_path = upload_chunk_path(upload_id, chunk_index)
+    chunk_path.write_bytes(chunk_bytes)
+    return to_upload_session_public(upload_session)
+
+
+@router.post("/uploads/{upload_id}/complete/", response_model=VideoPublic, status_code=201)
+async def complete_upload_session(
+    upload_id: str,
     session: Session = Depends(get_session),
     storage: StorageBackend = Depends(get_storage),
     current_user: CurrentUser = Depends(get_current_user),
 ) -> VideoPublic:
-    await enforce_rate_limit("upload_video_ip", client_identifier(request), 20, 3600)
-    await enforce_rate_limit("upload_video_user", f"user:{current_user.id}", 5, 3600)
-    validate_video_upload(file)
-    if thumbnail:
-        validate_thumbnail_upload(thumbnail)
-    clean_title = title.strip()
-    if not clean_title:
-        raise HTTPException(status_code=400, detail="Title is required")
+    upload_session = get_upload_session(session, upload_id)
+    ensure_upload_session_access(upload_session, current_user)
+    if upload_session.status != "uploading":
+        raise HTTPException(status_code=409, detail="Upload session is not ready to complete")
+
+    received_chunks, received_size_bytes, total_chunks, is_complete = upload_session_progress(upload_session)
+    if not is_complete:
+        raise HTTPException(status_code=409, detail="Upload is incomplete")
 
     stored_object = None
-    stored_thumbnail = None
+    assembled_path = None
+    upload_session.status = "assembling"
+    session.add(upload_session)
+    session.commit()
+
     try:
-        stored_object = await storage.save_upload(file, settings.MAX_UPLOAD_SIZE_BYTES)
-        if thumbnail:
-            stored_thumbnail = await storage.save_upload(thumbnail, settings.MAX_THUMBNAIL_SIZE_BYTES)
-        video = Video(
-            title=clean_title,
-            description=description.strip() if description else None,
-            original_filename=file.filename,
-            content_type=file.content_type,
+        with tempfile.NamedTemporaryFile(delete=False) as temporary_file:
+            assembled_path = Path(temporary_file.name)
+
+        with assembled_path.open("wb") as assembled_file:
+            for chunk_index in range(total_chunks):
+                assembled_file.write(upload_chunk_path(upload_id, chunk_index).read_bytes())
+
+        suffix = Path(upload_session.original_filename).suffix or ".mp4"
+        stored_object = storage.save_file(assembled_path, suffix, settings.MAX_UPLOAD_SIZE_BYTES)
+        video = create_video_record(
+            title=upload_session.title,
+            description=upload_session.description,
+            original_filename=upload_session.original_filename,
+            content_type=upload_session.content_type,
             size_bytes=stored_object.size_bytes,
-            author_id=current_user.id,
-            author_username=current_user.username,
-            author_first_name=current_user.first_name,
-            author_last_name=current_user.last_name,
             storage_backend=storage.name,
             storage_key=stored_object.key,
-            thumbnail_storage_key=stored_thumbnail.key if stored_thumbnail else None,
-            thumbnail_content_type=thumbnail.content_type if stored_thumbnail else None,
-            thumbnail_size_bytes=stored_thumbnail.size_bytes if stored_thumbnail else None,
-            status="processing",
+            current_user=current_user,
         )
+        video.original_filename = upload_session.original_filename
+        video.content_type = upload_session.content_type
 
         session.add(video)
+        session.delete(upload_session)
         session.commit()
+        session.refresh(video)
     except Exception:
         session.rollback()
-        if stored_thumbnail:
-            storage.delete(stored_thumbnail.key)
+        with Session(session.get_bind()) as retry_session:
+            retry_upload_session = retry_session.get(VideoUploadSession, upload_id)
+            if retry_upload_session:
+                retry_upload_session.status = "uploading"
+                retry_session.add(retry_upload_session)
+                retry_session.commit()
         if stored_object:
             storage.delete(stored_object.key)
         raise
+    finally:
+        cleanup_upload_session_files(upload_id)
+        if assembled_path is not None:
+            assembled_path.unlink(missing_ok=True)
 
     enqueue_video_processing(video.id)
-    session.refresh(video)
     return to_video_public(video, get_video_variants(session, video.id))
+
+
+@router.delete("/uploads/{upload_id}", status_code=204)
+async def delete_upload_session(
+    upload_id: str,
+    session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> None:
+    upload_session = get_upload_session(session, upload_id)
+    ensure_upload_session_access(upload_session, current_user)
+    cleanup_upload_session_files(upload_id)
+    session.delete(upload_session)
+    session.commit()
 
 
 @router.put("/{video_id}/thumbnail/", response_model=VideoPublic)
@@ -279,6 +519,49 @@ async def download_video(
     )
 
 
+@router.get("/{video_id}/hls/master.m3u8")
+async def download_hls_master_playlist(
+    video_id: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    storage: StorageBackend = Depends(get_storage),
+) -> StreamingResponse:
+    return await download_hls_asset(video_id, "master.m3u8", request, session, storage)
+
+
+@router.get("/{video_id}/hls/{asset_path:path}")
+async def download_hls_asset(
+    video_id: str,
+    asset_path: str,
+    request: Request,
+    session: Session = Depends(get_session),
+    storage: StorageBackend = Depends(get_storage),
+) -> StreamingResponse:
+    await enforce_rate_limit("download_video_ip", client_identifier(request), 600, 60)
+    video = session.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    mark_stale_processing_videos(session, [video])
+    if video.status != "ready":
+        raise HTTPException(status_code=409, detail="Video is still processing")
+
+    storage_key = safe_hls_asset_key(video, asset_path)
+    file_path = storage.path_for(storage_key)
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="HLS asset not found")
+
+    async def stream_file():
+        with file_path.open("rb") as stored_file:
+            while chunk := stored_file.read(1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        stream_file(),
+        media_type=hls_media_type(storage_key),
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @router.get("/{video_id}/thumbnail/")
 async def download_video_thumbnail(
     video_id: str,
@@ -360,6 +643,8 @@ async def delete_video(
         session.delete(variant)
     if video.thumbnail_storage_key:
         storage.delete(video.thumbnail_storage_key)
+    if video.hls_storage_prefix:
+        storage.delete_prefix(video.hls_storage_prefix)
     session.delete(video)
     session.commit()
     return VideoDeleteResponse(message="Video deleted successfully")

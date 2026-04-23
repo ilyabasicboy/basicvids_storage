@@ -7,11 +7,10 @@ import pytest
 
 from basicvids_storage.routers import videos as videos_router
 from basicvids_storage.auth import CurrentUser, get_current_user
-from basicvids_storage.models.videos import Video, VideoPublic, VideoVariant
+from basicvids_storage.models.videos import Video, VideoPublic, VideoUploadSession, VideoVariant
 from basicvids_storage import tasks as video_tasks
 from basicvids_storage.tasks import process_video_async
-from basicvids_storage.thumbnails import GeneratedThumbnail
-from basicvids_storage.transcoding import TranscodedVideoVariant
+from basicvids_storage.transcoding import GeneratedHlsVideo, TranscodedVideoVariant
 from basicvids_storage.tests import app, engine, temporary_directory
 from basicvids_storage.storage.disk import DiskStorage
 from basicvids_storage.models.videos import utc_now
@@ -63,11 +62,16 @@ class BaseTestVideos:
                 )
             ]
 
+        async def generate_hls(_video_path, _storage, _settings):
+            return None
+
         monkeypatch.setattr(video_tasks, "generate_transcoded_video_variants", generate_variants)
+        monkeypatch.setattr(video_tasks, "generate_hls_video", generate_hls)
         monkeypatch.setattr(video_tasks, "probe_video_duration", probe_duration)
         monkeypatch.setattr(video_tasks, "generate_video_thumbnail", generate_thumbnail)
         monkeypatch.setattr(video_tasks, "engine", engine)
         monkeypatch.setattr(video_tasks, "build_storage", lambda: DiskStorage(root_path=temporary_directory.name))
+        monkeypatch.setattr(videos_router.settings, "DATA_PATH", Path(temporary_directory.name))
 
         monkeypatch.setattr(videos_router, "enqueue_video_processing", lambda _video_id: None)
 
@@ -75,147 +79,151 @@ class BaseTestVideos:
         set_current_user(user())
         with Session(engine) as session:
             session.exec(delete(VideoVariant))
+            session.exec(delete(VideoUploadSession))
             session.exec(delete(Video))
             session.commit()
         for path in Path(temporary_directory.name).iterdir():
             if path.is_file():
                 path.unlink()
+            elif path.is_dir():
+                for child in sorted(path.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink()
+                    elif child.is_dir():
+                        child.rmdir()
+                path.rmdir()
+
+    async def create_processing_video(self, title: str = "Test clip", description: str = "A test upload", content: bytes = b"fake-video-bytes"):
+        response = await request(
+            "POST",
+            "/api/v1/videos/uploads/",
+            json={
+                "title": title,
+                "description": description,
+                "original_filename": "clip.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": len(content),
+                "chunk_size_bytes": len(content),
+            },
+        )
+        upload_session = response.json()
+        await request("PUT", f"/api/v1/videos/uploads/{upload_session['id']}/chunks/0", content=content)
+        response = await request("POST", f"/api/v1/videos/uploads/{upload_session['id']}/complete/")
+        return response.json()
 
 
-class TestVideosUpload(BaseTestVideos):
-    method_url = "/api/v1/videos/upload/"
+class TestVideoResumableUpload(BaseTestVideos):
+    method_url = "/api/v1/videos/uploads/"
 
-    async def test_upload_video_success(self):
+    async def create_upload_session(self, total_size_bytes: int, chunk_size_bytes: int = 4):
         response = await request(
             "POST",
             self.method_url,
-            data={
-                "title": "Test clip",
-                "description": "A test upload",
+            json={
+                "title": "Chunked clip",
+                "description": "Resumable upload",
+                "original_filename": "chunked.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": total_size_bytes,
+                "chunk_size_bytes": chunk_size_bytes,
             },
-            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+        )
+        assert response.status_code == 201
+        return response.json()
+
+    async def test_create_upload_session_success(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            json={
+                "title": "Chunked clip",
+                "description": "Resumable upload",
+                "original_filename": "chunked.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": 10,
+                "chunk_size_bytes": 4,
+            },
         )
 
         assert response.status_code == 201
         response_data = response.json()
-        assert VideoPublic(**response_data)
-        assert response_data["original_filename"] == "clip.mp4"
-        assert response_data["content_type"] == "video/mp4"
-        assert response_data["size_bytes"] == len(b"fake-video-bytes")
-        assert response_data["author_id"] == 1
-        assert response_data["author_first_name"] == "Test"
-        assert response_data["author_last_name"] == "Author"
-        assert response_data["author_username"] == "user-1"
-        assert response_data["title"] == "Test clip"
-        assert response_data["description"] == "A test upload"
-        assert response_data["has_thumbnail"] is False
-        assert response_data["status"] == "processing"
-        assert response_data["qualities"] == []
+        assert response_data["title"] == "Chunked clip"
+        assert response_data["received_chunks"] == []
+        assert response_data["received_size_bytes"] == 0
+        assert response_data["total_chunks"] == 3
+        assert response_data["is_complete"] is False
 
-    async def test_upload_video_with_thumbnail_success(self):
-        response = await request(
-            "POST",
-            self.method_url,
-            data={
-                "title": "Test clip",
-                "description": "A test upload",
-            },
-            files={
-                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
-                "thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg"),
-            },
-        )
+    async def test_upload_chunks_and_complete_session(self):
+        upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=4)
+        upload_id = upload_session["id"]
 
-        assert response.status_code == 201
-        response_data = response.json()
-        assert response_data["has_thumbnail"] is True
-
-    async def test_upload_video_generates_thumbnail_when_missing(self, monkeypatch, tmp_path):
-        async def generate_thumbnail(video_path, storage, settings):
-            assert video_path.exists()
-            source_path = tmp_path / "generated.jpg"
-            source_path.write_bytes(b"generated-image-bytes")
-            return GeneratedThumbnail(
-                stored_object=storage.save_file(source_path, ".jpg", settings.MAX_THUMBNAIL_SIZE_BYTES),
-                content_type="image/jpeg",
-            )
-
-        monkeypatch.setattr(video_tasks, "generate_video_thumbnail", generate_thumbnail)
-
-        response = await request(
-            "POST",
-            self.method_url,
-            data={
-                "title": "Test clip",
-                "description": "A test upload",
-            },
-            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
-        )
-
-        assert response.status_code == 201
-        response_data = response.json()
-        assert response_data["status"] == "processing"
-        await process_video_async(response_data["id"])
-
-        response = await request("GET", f"/api/v1/videos/{response_data['id']}")
-        response_data = response.json()
-        assert response_data["has_thumbnail"] is True
-
-        response = await request("GET", f"/api/v1/videos/{response_data['id']}/thumbnail/")
-
+        response = await request("PUT", f"{self.method_url}{upload_id}/chunks/0", content=b"fake")
         assert response.status_code == 200
-        assert response.headers["content-type"] == "image/jpeg"
-        assert response.content == b"generated-image-bytes"
+        assert response.json()["received_chunks"] == [0]
 
-    async def test_upload_video_rejects_non_image_thumbnail(self):
-        response = await request(
-            "POST",
-            self.method_url,
-            data={"title": "Test clip"},
-            files={
-                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
-                "thumbnail": ("notes.txt", b"text", "text/plain"),
-            },
-        )
+        response = await request("PUT", f"{self.method_url}{upload_id}/chunks/1", content=b"-vid")
+        assert response.status_code == 200
+        assert response.json()["received_chunks"] == [0, 1]
 
-        assert response.status_code == 415
+        response = await request("GET", f"{self.method_url}{upload_id}")
+        assert response.status_code == 200
+        assert response.json()["received_size_bytes"] == 8
+        assert response.json()["is_complete"] is False
 
-    async def test_upload_video_unauthorized(self):
-        app.dependency_overrides.pop(get_current_user, None)
-        response = await request(
-            "POST",
-            self.method_url,
-            data={"title": "Test clip"},
-            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
-        )
+        response = await request("PUT", f"{self.method_url}{upload_id}/chunks/2", content=b"eo")
+        assert response.status_code == 200
+        assert response.json()["is_complete"] is True
 
-        assert response.status_code == 401
+        response = await request("POST", f"{self.method_url}{upload_id}/complete/")
 
-    async def test_upload_rejects_non_video(self):
-        response = await request(
-            "POST",
-            self.method_url,
-            data={"title": "Notes"},
-            files={"file": ("notes.txt", b"text", "text/plain")},
-        )
+        assert response.status_code == 201
+        response_data = response.json()
+        assert response_data["original_filename"] == "chunked.mp4"
+        assert response_data["content_type"] == "video/mp4"
+        assert response_data["status"] == "processing"
 
-        assert response.status_code == 415
+        await process_video_async(response_data["id"])
+        response = await request("GET", f"/api/v1/videos/{response_data['id']}/download/")
+        assert response.status_code == 200
+        assert response.content == b"fake-video"
+
+        with Session(engine) as session:
+            assert session.get(VideoUploadSession, upload_id) is None
+
+    async def test_complete_upload_requires_all_chunks(self):
+        upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=4)
+        upload_id = upload_session["id"]
+        await request("PUT", f"{self.method_url}{upload_id}/chunks/0", content=b"fake")
+
+        response = await request("POST", f"{self.method_url}{upload_id}/complete/")
+
+        assert response.status_code == 409
+
+    async def test_upload_chunk_rejects_wrong_size(self):
+        upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=4)
+        upload_id = upload_session["id"]
+
+        response = await request("PUT", f"{self.method_url}{upload_id}/chunks/0", content=b"bad")
+
+        assert response.status_code == 400
+
+    async def test_delete_upload_session_success(self):
+        upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=4)
+        upload_id = upload_session["id"]
+        await request("PUT", f"{self.method_url}{upload_id}/chunks/0", content=b"fake")
+
+        response = await request("DELETE", f"{self.method_url}{upload_id}")
+
+        assert response.status_code == 204
+        response = await request("GET", f"{self.method_url}{upload_id}")
+        assert response.status_code == 404
 
 
 class TestVideosRead(BaseTestVideos):
     method_url = "/api/v1/videos"
 
     async def create_video(self, title: str = "Test clip", description: str = "A test upload"):
-        response = await request(
-            "POST",
-            f"{self.method_url}/upload/",
-            data={
-                "title": title,
-                "description": description,
-            },
-            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
-        )
-        video = response.json()
+        video = await self.create_processing_video(title=title, description=description)
         await process_video_async(video["id"])
         response = await request("GET", f"{self.method_url}/{video['id']}")
         return response.json()
@@ -304,10 +312,19 @@ class TestVideosRead(BaseTestVideos):
     async def test_get_video_marks_stale_processing_as_failed(self):
         response = await request(
             "POST",
-            f"{self.method_url}/upload/",
-            data={"title": "Stuck clip"},
-            files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+            "/api/v1/videos/uploads/",
+            json={
+                "title": "Stuck clip",
+                "original_filename": "clip.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": len(b"fake-video-bytes"),
+                "chunk_size_bytes": len(b"fake-video-bytes"),
+            },
         )
+        upload_session = response.json()
+        response = await request("PUT", f"/api/v1/videos/uploads/{upload_session['id']}/chunks/0", content=b"fake-video-bytes")
+        assert response.status_code == 200
+        response = await request("POST", f"/api/v1/videos/uploads/{upload_session['id']}/complete/")
         video = response.json()
 
         with Session(engine) as session:
@@ -352,17 +369,82 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 404
 
+    async def test_hls_playlist_and_segments_success(self, monkeypatch, tmp_path):
+        async def generate_hls(_video_path, storage, settings):
+            master_path = tmp_path / "master.m3u8"
+            playlist_path = tmp_path / "playlist.m3u8"
+            segment_path = tmp_path / "segment-00000.ts"
+            master_path.write_text("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=600000\n720p/playlist.m3u8\n")
+            playlist_path.write_text("#EXTM3U\n#EXTINF:6.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n")
+            segment_path.write_bytes(b"fake-hls-segment")
+            prefix = "hls/test-video"
+            manifest = storage.save_file_as(master_path, f"{prefix}/master.m3u8", settings.MAX_UPLOAD_SIZE_BYTES)
+            playlist = storage.save_file_as(playlist_path, f"{prefix}/720p/playlist.m3u8", settings.MAX_UPLOAD_SIZE_BYTES)
+            segment = storage.save_file_as(segment_path, f"{prefix}/720p/segment-00000.ts", settings.MAX_UPLOAD_SIZE_BYTES)
+            return GeneratedHlsVideo(
+                storage_prefix=prefix,
+                manifest_stored_object=manifest,
+                stored_objects=[manifest, playlist, segment],
+            )
+
+        monkeypatch.setattr(video_tasks, "generate_hls_video", generate_hls)
+        video = await self.create_video()
+
+        assert video["has_hls"] is True
+
+        response = await request("GET", f"{self.method_url}/{video['id']}/hls/master.m3u8")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/vnd.apple.mpegurl"
+        assert b"720p/playlist.m3u8" in response.content
+
+        response = await request("GET", f"{self.method_url}/{video['id']}/hls/720p/segment-00000.ts")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "video/mp2t"
+        assert response.content == b"fake-hls-segment"
+
+    async def test_hls_asset_rejects_path_traversal(self, monkeypatch, tmp_path):
+        async def generate_hls(_video_path, storage, settings):
+            master_path = tmp_path / "master.m3u8"
+            master_path.write_text("#EXTM3U\n")
+            prefix = "hls/test-video"
+            manifest = storage.save_file_as(master_path, f"{prefix}/master.m3u8", settings.MAX_UPLOAD_SIZE_BYTES)
+            return GeneratedHlsVideo(
+                storage_prefix=prefix,
+                manifest_stored_object=manifest,
+                stored_objects=[manifest],
+            )
+
+        monkeypatch.setattr(video_tasks, "generate_hls_video", generate_hls)
+        video = await self.create_video()
+
+        response = await request("GET", f"{self.method_url}/{video['id']}/hls/../database.db")
+
+        assert response.status_code in {400, 404}
+
     async def test_download_video_thumbnail_success(self):
         response = await request(
             "POST",
-            f"{self.method_url}/upload/",
-            data={"title": "Test clip"},
-            files={
-                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
-                "thumbnail": ("thumb.png", b"fake-image-bytes", "image/png"),
+            "/api/v1/videos/uploads/",
+            json={
+                "title": "Test clip",
+                "original_filename": "clip.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": len(b"fake-video-bytes"),
+                "chunk_size_bytes": len(b"fake-video-bytes"),
             },
         )
+        upload_session = response.json()
+        await request("PUT", f"/api/v1/videos/uploads/{upload_session['id']}/chunks/0", content=b"fake-video-bytes")
+        response = await request("POST", f"/api/v1/videos/uploads/{upload_session['id']}/complete/")
         video = response.json()
+        await process_video_async(video["id"])
+
+        response = await request(
+            "PUT",
+            f"{self.method_url}/{video['id']}/thumbnail/",
+            files={"thumbnail": ("thumb.png", b"fake-image-bytes", "image/png")},
+        )
+        assert response.status_code == 200
 
         response = await request("GET", f"{self.method_url}/{video['id']}/thumbnail/")
 
@@ -378,7 +460,7 @@ class TestVideosRead(BaseTestVideos):
 
     async def test_set_video_thumbnail_success(self):
         video = await self.create_video()
-        stored_files = list(Path(temporary_directory.name).iterdir())
+        stored_files = [path for path in Path(temporary_directory.name).iterdir() if path.is_file()]
         assert len(stored_files) == 1
 
         response = await request(
@@ -389,7 +471,7 @@ class TestVideosRead(BaseTestVideos):
 
         assert response.status_code == 200
         assert response.json()["has_thumbnail"] is True
-        assert len(list(Path(temporary_directory.name).iterdir())) == 2
+        assert len([path for path in Path(temporary_directory.name).iterdir() if path.is_file()]) == 2
 
         response = await request(
             "PUT",
@@ -398,7 +480,7 @@ class TestVideosRead(BaseTestVideos):
         )
 
         assert response.status_code == 200
-        assert len(list(Path(temporary_directory.name).iterdir())) == 2
+        assert len([path for path in Path(temporary_directory.name).iterdir() if path.is_file()]) == 2
 
     async def test_set_video_thumbnail_forbidden_for_non_author(self):
         video = await self.create_video()
@@ -446,15 +528,27 @@ class TestVideosRead(BaseTestVideos):
     async def test_delete_video_success(self):
         response = await request(
             "POST",
-            f"{self.method_url}/upload/",
-            data={"title": "Test clip"},
-            files={
-                "file": ("clip.mp4", b"fake-video-bytes", "video/mp4"),
-                "thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg"),
+            "/api/v1/videos/uploads/",
+            json={
+                "title": "Test clip",
+                "original_filename": "clip.mp4",
+                "content_type": "video/mp4",
+                "total_size_bytes": len(b"fake-video-bytes"),
+                "chunk_size_bytes": len(b"fake-video-bytes"),
             },
         )
+        upload_session = response.json()
+        await request("PUT", f"/api/v1/videos/uploads/{upload_session['id']}/chunks/0", content=b"fake-video-bytes")
+        response = await request("POST", f"/api/v1/videos/uploads/{upload_session['id']}/complete/")
         video = response.json()
-        stored_files = list(Path(temporary_directory.name).iterdir())
+        await process_video_async(video["id"])
+        response = await request(
+            "PUT",
+            f"{self.method_url}/{video['id']}/thumbnail/",
+            files={"thumbnail": ("thumb.jpg", b"fake-image-bytes", "image/jpeg")},
+        )
+        assert response.status_code == 200
+        stored_files = [path for path in Path(temporary_directory.name).iterdir() if path.is_file()]
         assert len(stored_files) == 2
 
         response = await request("DELETE", f"{self.method_url}/{video['id']}")
@@ -464,7 +558,7 @@ class TestVideosRead(BaseTestVideos):
 
         response = await request("GET", f"{self.method_url}/{video['id']}")
         assert response.status_code == 404
-        assert list(Path(temporary_directory.name).iterdir()) == []
+        assert [path for path in Path(temporary_directory.name).iterdir() if path.is_file()] == []
 
     async def test_delete_video_forbidden_for_non_author(self):
         video = await self.create_video()

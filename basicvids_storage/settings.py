@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     VIDEO_TRANSCODE_QUEUE: str = "video_transcode"
     VIDEO_TRANSCODE_WORKER_CONCURRENCY: int = Field(default=1, ge=1, le=8)
     AUTH_CURRENT_USER_URL: str = "http://basicvids_auth:8000/api/v1/users/detail/"
+    VIDEO_UPLOAD_CHUNK_SIZE_BYTES: int = Field(default=8 * 1024 * 1024, gt=0)
 
     model_config = SettingsConfigDict(
         env_file="./data/.env",
@@ -38,6 +39,10 @@ class Settings(BaseSettings):
     @property
     def video_storage_path(self) -> Path:
         return self.DATA_PATH / self.VIDEO_STORAGE_DIR
+
+    @property
+    def resumable_upload_path(self) -> Path:
+        return self.DATA_PATH / "resumable_uploads"
 
 
 settings = Settings()

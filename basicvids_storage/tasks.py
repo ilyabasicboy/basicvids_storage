@@ -9,7 +9,7 @@ from basicvids_storage.models.videos import Video, VideoVariant
 from basicvids_storage.settings import settings
 from basicvids_storage.storage import build_storage
 from basicvids_storage.thumbnails import generate_video_thumbnail, probe_video_duration
-from basicvids_storage.transcoding import generate_transcoded_video_variants
+from basicvids_storage.transcoding import generate_hls_video, generate_transcoded_video_variants
 
 
 async def process_video_async(video_id: str) -> None:
@@ -31,13 +31,16 @@ async def process_video_async(video_id: str) -> None:
 
     stored_variant_keys = []
     stored_thumbnail_key = None
+    stored_hls_prefix = None
     try:
         duration_seconds = await probe_video_duration(source_path, settings.THUMBNAIL_GENERATION_TIMEOUT_SECONDS)
         transcoded_variants = await generate_transcoded_video_variants(source_path, storage, settings)
         if not transcoded_variants:
             raise RuntimeError("Video transcoding failed")
+        hls_video = await generate_hls_video(source_path, storage, settings)
 
         stored_variant_keys = [variant.stored_object.key for variant in transcoded_variants]
+        stored_hls_prefix = hls_video.storage_prefix if hls_video else None
         with Session(engine) as session:
             current_video = session.get(Video, video_id)
             should_generate_thumbnail = bool(current_video and not current_video.thumbnail_storage_key)
@@ -53,10 +56,13 @@ async def process_video_async(video_id: str) -> None:
                     storage.delete(key)
                 if stored_thumbnail_key:
                     storage.delete(stored_thumbnail_key)
+                if stored_hls_prefix:
+                    storage.delete_prefix(stored_hls_prefix)
                 storage.delete(source_key)
                 return
 
             old_thumbnail_key = video.thumbnail_storage_key
+            old_hls_prefix = video.hls_storage_prefix
             for variant in session.exec(select(VideoVariant).where(VideoVariant.video_id == video.id)).all():
                 session.delete(variant)
 
@@ -75,6 +81,8 @@ async def process_video_async(video_id: str) -> None:
             video.content_type = primary_variant.content_type
             video.size_bytes = sum(variant.stored_object.size_bytes for variant in transcoded_variants)
             video.duration_seconds = duration_seconds
+            video.hls_storage_prefix = hls_video.storage_prefix if hls_video else None
+            video.hls_manifest_storage_key = hls_video.manifest_stored_object.key if hls_video else None
             video.thumbnail_storage_key = stored_thumbnail_key
             video.thumbnail_content_type = generated_thumbnail.content_type if generated_thumbnail else None
             video.thumbnail_size_bytes = generated_thumbnail.stored_object.size_bytes if generated_thumbnail else None
@@ -85,6 +93,8 @@ async def process_video_async(video_id: str) -> None:
 
             if old_thumbnail_key and old_thumbnail_key != stored_thumbnail_key:
                 storage.delete(old_thumbnail_key)
+            if old_hls_prefix and old_hls_prefix != stored_hls_prefix:
+                storage.delete_prefix(old_hls_prefix)
 
         storage.delete(source_key)
     except Exception as error:
@@ -92,6 +102,8 @@ async def process_video_async(video_id: str) -> None:
             storage.delete(key)
         if stored_thumbnail_key:
             storage.delete(stored_thumbnail_key)
+        if stored_hls_prefix:
+            storage.delete_prefix(stored_hls_prefix)
 
         with Session(engine) as session:
             video = session.get(Video, video_id)

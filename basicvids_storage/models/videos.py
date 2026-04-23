@@ -26,6 +26,8 @@ class Video(SQLModel, table=True):
     thumbnail_content_type: str | None = Field(default=None, max_length=100)
     thumbnail_size_bytes: int | None = Field(default=None, ge=0)
     duration_seconds: float | None = Field(default=None, ge=0)
+    hls_storage_prefix: str | None = Field(default=None, max_length=500)
+    hls_manifest_storage_key: str | None = Field(default=None, max_length=500)
     status: str = Field(default="processing", max_length=20, index=True)
     processing_error: str | None = Field(default=None, max_length=2000)
     created_at: datetime = Field(default_factory=utc_now)
@@ -38,6 +40,22 @@ class VideoVariant(SQLModel, table=True):
     storage_key: str = Field(unique=True, max_length=500)
     content_type: str = Field(default="video/mp4", max_length=100)
     size_bytes: int = Field(ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class VideoUploadSession(SQLModel, table=True):
+    id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
+    title: str = Field(max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
+    original_filename: str = Field(max_length=255)
+    content_type: str = Field(max_length=100)
+    total_size_bytes: int = Field(ge=1)
+    chunk_size_bytes: int = Field(ge=1)
+    author_id: int = Field(index=True)
+    author_username: str | None = Field(default=None, max_length=100)
+    author_first_name: str | None = Field(default=None, max_length=100)
+    author_last_name: str | None = Field(default=None, max_length=100)
+    status: str = Field(default="uploading", max_length=20, index=True)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -64,6 +82,7 @@ class VideoPublic(BaseModel):
     status: str
     processing_error: str | None = None
     duration_seconds: float | None = None
+    hls_manifest_storage_key: str | None = PydanticField(default=None, exclude=True)
     thumbnail_storage_key: str | None = PydanticField(default=None, exclude=True)
     created_at: datetime
     qualities: list[VideoQualityPublic] = PydanticField(default_factory=list)
@@ -72,6 +91,11 @@ class VideoPublic(BaseModel):
     @property
     def has_thumbnail(self) -> bool:
         return bool(self.thumbnail_storage_key)
+
+    @computed_field
+    @property
+    def has_hls(self) -> bool:
+        return bool(self.hls_manifest_storage_key)
 
 
 class VideoChange(BaseModel):
@@ -86,3 +110,31 @@ class VideoList(BaseModel):
 
 class VideoDeleteResponse(BaseModel):
     message: str
+
+
+class VideoUploadSessionCreate(BaseModel):
+    title: str
+    description: str | None = None
+    original_filename: str
+    content_type: str
+    total_size_bytes: int = PydanticField(gt=0)
+    chunk_size_bytes: int | None = PydanticField(default=None, gt=0)
+
+
+class VideoUploadSessionPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    description: str | None = None
+    original_filename: str
+    content_type: str
+    total_size_bytes: int
+    chunk_size_bytes: int
+    author_id: int
+    status: str
+    created_at: datetime
+    received_chunks: list[int] = PydanticField(default_factory=list)
+    received_size_bytes: int = 0
+    total_chunks: int = 0
+    is_complete: bool = False

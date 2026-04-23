@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
@@ -43,7 +44,13 @@ class DiskStorage:
 
         clean_suffix = suffix if suffix.startswith(".") else f".{suffix}"
         key = f"{uuid4().hex}{clean_suffix.lower()}"
+        return self.save_file_as(source_path, key, max_size_bytes)
+
+    def save_file_as(self, source_path: Path, key: str, max_size_bytes: int) -> DiskStoredObject:
+        self.root_path.mkdir(parents=True, exist_ok=True)
+
         final_path = self.path_for(key)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = final_path.with_suffix(f"{final_path.suffix}.part")
 
         size_bytes = 0
@@ -68,3 +75,8 @@ class DiskStorage:
 
     def delete(self, key: str) -> None:
         self.path_for(key).unlink(missing_ok=True)
+
+    def delete_prefix(self, prefix: str) -> None:
+        path = self.path_for(prefix)
+        if path.is_dir():
+            shutil.rmtree(path)
