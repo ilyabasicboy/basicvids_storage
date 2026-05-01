@@ -7,6 +7,7 @@ import pytest
 
 from basicvids_storage.routers import videos as videos_router
 from basicvids_storage.auth import CurrentUser, get_current_user
+from basicvids_storage.models.categories import Category
 from basicvids_storage.models.videos import Video, VideoPublic, VideoUploadSession, VideoVariant
 from basicvids_storage import tasks as video_tasks
 from basicvids_storage.tasks import process_video_async
@@ -81,6 +82,7 @@ class BaseTestVideos:
             session.exec(delete(VideoVariant))
             session.exec(delete(VideoUploadSession))
             session.exec(delete(Video))
+            session.exec(delete(Category))
             session.commit()
         for path in Path(temporary_directory.name).iterdir():
             if path.is_file():
@@ -93,7 +95,13 @@ class BaseTestVideos:
                         child.rmdir()
                 path.rmdir()
 
-    async def create_processing_video(self, title: str = "Test clip", description: str = "A test upload", content: bytes = b"fake-video-bytes"):
+    async def create_processing_video(
+        self,
+        title: str = "Test clip",
+        description: str = "A test upload",
+        content: bytes = b"fake-video-bytes",
+        category_id: int | None = None,
+    ):
         response = await request(
             "POST",
             "/api/v1/videos/uploads/",
@@ -104,6 +112,7 @@ class BaseTestVideos:
                 "content_type": "video/mp4",
                 "total_size_bytes": len(content),
                 "chunk_size_bytes": len(content),
+                "category_id": category_id,
             },
         )
         upload_session = response.json()
@@ -222,11 +231,24 @@ class TestVideoResumableUpload(BaseTestVideos):
 class TestVideosRead(BaseTestVideos):
     method_url = "/api/v1/videos"
 
-    async def create_video(self, title: str = "Test clip", description: str = "A test upload"):
-        video = await self.create_processing_video(title=title, description=description)
+    async def create_video(
+        self,
+        title: str = "Test clip",
+        description: str = "A test upload",
+        category_id: int | None = None,
+    ):
+        video = await self.create_processing_video(title=title, description=description, category_id=category_id)
         await process_video_async(video["id"])
         response = await request("GET", f"{self.method_url}/{video['id']}")
         return response.json()
+
+    def create_category(self, name: str, slug: str, parent_id: int | None = None) -> Category:
+        with Session(engine) as session:
+            category = Category(name=name, slug=slug, parent_id=parent_id)
+            session.add(category)
+            session.commit()
+            session.refresh(category)
+            return category
 
     async def test_list_videos_success(self):
         await self.create_video()
@@ -309,6 +331,40 @@ class TestVideosRead(BaseTestVideos):
         assert response_data["count"] == 1
         assert response_data["videos"][0]["author_id"] == 2
 
+    async def test_list_videos_filters_by_category_with_descendants(self):
+        root = self.create_category("Education", "education")
+        child = self.create_category("Math", "math", parent_id=root.id)
+        grandchild = self.create_category("Algebra", "algebra", parent_id=child.id)
+        other = self.create_category("Travel", "travel")
+
+        await self.create_video(title="Linear equations", category_id=grandchild.id)
+        await self.create_video(title="Road trip", category_id=other.id)
+
+        response = await request("GET", f"{self.method_url}/", params={"category_id": root.id})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 1
+        assert response_data["videos"][0]["category"]["slug"] == "algebra"
+
+    async def test_list_videos_filters_by_exact_category_without_descendants(self):
+        root = self.create_category("Education", "education")
+        child = self.create_category("Math", "math", parent_id=root.id)
+
+        await self.create_video(title="General education", category_id=root.id)
+        await self.create_video(title="Trigonometry", category_id=child.id)
+
+        response = await request(
+            "GET",
+            f"{self.method_url}/",
+            params={"category_id": root.id, "include_subcategories": "false"},
+        )
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 1
+        assert response_data["videos"][0]["category"]["slug"] == "education"
+
     async def test_get_video_marks_stale_processing_as_failed(self):
         response = await request(
             "POST",
@@ -347,6 +403,16 @@ class TestVideosRead(BaseTestVideos):
         assert response.status_code == 200
         assert response.json()["id"] == video["id"]
         assert response.json()["duration_seconds"] == 125.0
+
+    async def test_get_video_returns_category(self):
+        category = self.create_category("Education", "education")
+        video = await self.create_video(category_id=category.id)
+
+        response = await request("GET", f"{self.method_url}/{video['id']}")
+
+        assert response.status_code == 200
+        assert response.json()["category"]["id"] == category.id
+        assert response.json()["category"]["slug"] == "education"
 
     async def test_download_video_success(self):
         video = await self.create_video()
@@ -495,6 +561,7 @@ class TestVideosRead(BaseTestVideos):
         assert response.status_code == 403
 
     async def test_change_video_success(self):
+        category = self.create_category("Education", "education")
         video = await self.create_video()
         response = await request(
             "PATCH",
@@ -502,6 +569,7 @@ class TestVideosRead(BaseTestVideos):
             json={
                 "title": "Changed title",
                 "description": "Changed description",
+                "category_id": category.id,
             },
         )
 
@@ -509,6 +577,7 @@ class TestVideosRead(BaseTestVideos):
         response_data = response.json()
         assert response_data["title"] == "Changed title"
         assert response_data["description"] == "Changed description"
+        assert response_data["category"]["slug"] == "education"
 
     async def test_change_video_forbidden_for_non_author(self):
         video = await self.create_video()

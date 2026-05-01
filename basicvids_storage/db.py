@@ -1,6 +1,8 @@
 from sqlalchemy import inspect, text
 from sqlmodel import Session, SQLModel, create_engine
 
+from basicvids_storage.models.categories import Category
+from basicvids_storage.models.videos import Video, VideoUploadSession, VideoVariant
 from basicvids_storage.settings import settings
 
 
@@ -15,6 +17,7 @@ def create_db_and_tables():
     migrate_video_columns()
     migrate_video_variant_table()
     migrate_video_upload_session_table()
+    migrate_category_table()
 
 
 def migrate_video_columns():
@@ -36,6 +39,8 @@ def migrate_video_columns():
             connection.execute(text("ALTER TABLE video ADD COLUMN author_first_name VARCHAR(100)"))
         if "author_last_name" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN author_last_name VARCHAR(100)"))
+        if "category_id" not in columns:
+            connection.execute(text("ALTER TABLE video ADD COLUMN category_id INTEGER"))
         if "thumbnail_storage_key" not in columns:
             connection.execute(text("ALTER TABLE video ADD COLUMN thumbnail_storage_key VARCHAR(500)"))
         if "thumbnail_content_type" not in columns:
@@ -59,25 +64,30 @@ def migrate_video_variant_table():
     if "video_variant" in inspector.get_table_names():
         return
 
-    video_variant_table = SQLModel.metadata.tables.get("video_variant")
-    if video_variant_table is None:
-        return
-
     with engine.begin() as connection:
-        video_variant_table.create(connection, checkfirst=True)
+        VideoVariant.__table__.create(connection, checkfirst=True)
 
 
 def migrate_video_upload_session_table():
     inspector = inspect(engine)
     if "videouploadsession" in inspector.get_table_names():
-        return
-
-    upload_session_table = SQLModel.metadata.tables.get("videouploadsession")
-    if upload_session_table is None:
+        columns = {column["name"] for column in inspector.get_columns("videouploadsession")}
+        with engine.begin() as connection:
+            if "category_id" not in columns:
+                connection.execute(text("ALTER TABLE videouploadsession ADD COLUMN category_id INTEGER"))
         return
 
     with engine.begin() as connection:
-        upload_session_table.create(connection, checkfirst=True)
+        VideoUploadSession.__table__.create(connection, checkfirst=True)
+
+
+def migrate_category_table():
+    inspector = inspect(engine)
+    if "category" in inspector.get_table_names():
+        return
+
+    with engine.begin() as connection:
+        Category.__table__.create(connection, checkfirst=True)
 
 
 async def get_session():

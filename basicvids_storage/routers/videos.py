@@ -12,7 +12,9 @@ from sqlalchemy import case, func, or_
 from sqlmodel import Session, col, select
 
 from basicvids_storage.auth import CurrentUser, get_current_user
+from basicvids_storage.categories import collect_descendant_ids, get_category_or_404
 from basicvids_storage.db import get_session
+from basicvids_storage.models.categories import Category, CategorySummary
 from basicvids_storage.models.videos import (
     Video,
     VideoChange,
@@ -64,6 +66,7 @@ def create_video_record(
     storage_backend: str,
     storage_key: str,
     current_user: CurrentUser,
+    category_id: int | None = None,
     thumbnail_storage_key: str | None = None,
     thumbnail_content_type: str | None = None,
     thumbnail_size_bytes: int | None = None,
@@ -82,6 +85,7 @@ def create_video_record(
         author_username=current_user.username,
         author_first_name=current_user.first_name,
         author_last_name=current_user.last_name,
+        category_id=category_id,
         storage_backend=storage_backend,
         storage_key=storage_key,
         thumbnail_storage_key=thumbnail_storage_key,
@@ -91,8 +95,19 @@ def create_video_record(
     )
 
 
-def to_video_public(video: Video, variants: list[VideoVariant] | None = None) -> VideoPublic:
+def to_video_public(
+    video: Video,
+    variants: list[VideoVariant] | None = None,
+    category: Category | None = None,
+) -> VideoPublic:
     video_public = VideoPublic.model_validate(video)
+    if category is not None and category.id is not None:
+        video_public.category = CategorySummary(
+            id=category.id,
+            name=category.name,
+            slug=category.slug,
+            parent_id=category.parent_id,
+        )
     video_public.qualities = [
         VideoQualityPublic(quality=variant.quality, label=f"{variant.quality}p", size_bytes=variant.size_bytes)
         for variant in sorted(variants or [], key=lambda item: item.quality)
@@ -102,6 +117,13 @@ def to_video_public(video: Video, variants: list[VideoVariant] | None = None) ->
 
 def get_video_variants(session: Session, video_id: str) -> list[VideoVariant]:
     return session.exec(select(VideoVariant).where(VideoVariant.video_id == video_id).order_by(col(VideoVariant.quality))).all()
+
+
+def get_categories_by_ids(session: Session, category_ids: list[int]) -> dict[int, Category]:
+    if not category_ids:
+        return {}
+    categories = session.exec(select(Category).where(col(Category.id).in_(category_ids))).all()
+    return {category.id: category for category in categories if category.id is not None}
 
 
 def hls_media_type(storage_key: str) -> str:
@@ -247,9 +269,12 @@ async def create_upload_session(
         author_username=current_user.username,
         author_first_name=current_user.first_name,
         author_last_name=current_user.last_name,
+        category_id=data.category_id,
     )
     if not upload_session.title:
         raise HTTPException(status_code=400, detail="Title is required")
+    if data.category_id is not None:
+        get_category_or_404(session, data.category_id)
 
     session.add(upload_session)
     session.commit()
@@ -336,6 +361,7 @@ async def complete_upload_session(
             storage_backend=storage.name,
             storage_key=stored_object.key,
             current_user=current_user,
+            category_id=upload_session.category_id,
         )
         video.original_filename = upload_session.original_filename
         video.content_type = upload_session.content_type
@@ -361,7 +387,8 @@ async def complete_upload_session(
             assembled_path.unlink(missing_ok=True)
 
     enqueue_video_processing(video.id)
-    return to_video_public(video, get_video_variants(session, video.id))
+    categories_by_id = get_categories_by_ids(session, [video.category_id] if video.category_id is not None else [])
+    return to_video_public(video, get_video_variants(session, video.id), categories_by_id.get(video.category_id))
 
 
 @router.delete("/uploads/{upload_id}", status_code=204)
@@ -413,7 +440,8 @@ async def set_video_thumbnail(
     if old_thumbnail_key:
         storage.delete(old_thumbnail_key)
     session.refresh(video)
-    return to_video_public(video, get_video_variants(session, video.id))
+    categories_by_id = get_categories_by_ids(session, [video.category_id] if video.category_id is not None else [])
+    return to_video_public(video, get_video_variants(session, video.id), categories_by_id.get(video.category_id))
 
 
 @router.get("/", response_model=VideoList)
@@ -422,6 +450,8 @@ async def list_videos(
     limit: int = Query(default=30, ge=1, le=30),
     search: str | None = Query(default=None, max_length=255),
     author_id: int | None = Query(default=None, ge=1),
+    category_id: int | None = Query(default=None, ge=1),
+    include_subcategories: bool = Query(default=True),
     session: Session = Depends(get_session),
 ) -> VideoList:
     statement = select(Video)
@@ -432,6 +462,19 @@ async def list_videos(
         author_filter = Video.author_id == author_id
         statement = statement.where(author_filter)
         count_statement = count_statement.where(author_filter)
+
+    if category_id is not None:
+        all_categories = session.exec(select(Category)).all()
+        if not any(category.id == category_id for category in all_categories):
+            raise HTTPException(status_code=404, detail="Category not found")
+        category_ids = (
+            collect_descendant_ids(all_categories, category_id)
+            if include_subcategories
+            else {category_id}
+        )
+        category_filter = col(Video.category_id).in_(category_ids)
+        statement = statement.where(category_filter)
+        count_statement = count_statement.where(category_filter)
 
     if clean_search:
         search_pattern = f"%{clean_search.lower()}%"
@@ -451,13 +494,18 @@ async def list_videos(
     mark_stale_processing_videos(session, videos)
     total_count = session.exec(count_statement).one()
     video_ids = [video.id for video in videos]
+    category_ids = [video.category_id for video in videos if video.category_id is not None]
+    categories_by_id = get_categories_by_ids(session, category_ids)
     variants_by_video_id = {video_id: [] for video_id in video_ids}
     if video_ids:
         variants = session.exec(select(VideoVariant).where(col(VideoVariant.video_id).in_(video_ids))).all()
         for variant in variants:
             variants_by_video_id.setdefault(variant.video_id, []).append(variant)
     return VideoList(
-        videos=[to_video_public(video, variants_by_video_id.get(video.id, [])) for video in videos],
+        videos=[
+            to_video_public(video, variants_by_video_id.get(video.id, []), categories_by_id.get(video.category_id))
+            for video in videos
+        ],
         count=total_count,
     )
 
@@ -471,7 +519,8 @@ async def get_video(
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     mark_stale_processing_videos(session, [video])
-    return to_video_public(video, get_video_variants(session, video.id))
+    categories_by_id = get_categories_by_ids(session, [video.category_id] if video.category_id is not None else [])
+    return to_video_public(video, get_video_variants(session, video.id), categories_by_id.get(video.category_id))
 
 
 @router.get("/{video_id}/download/")
@@ -612,10 +661,17 @@ async def change_video(
 
     video.title = clean_title
     video.description = data.description.strip() if data.description else None
+    if "category_id" in data.model_fields_set:
+        if data.category_id is None:
+            video.category_id = None
+        else:
+            get_category_or_404(session, data.category_id)
+            video.category_id = data.category_id
     session.add(video)
     session.commit()
     session.refresh(video)
-    return to_video_public(video, get_video_variants(session, video.id))
+    categories_by_id = get_categories_by_ids(session, [video.category_id] if video.category_id is not None else [])
+    return to_video_public(video, get_video_variants(session, video.id), categories_by_id.get(video.category_id))
 
 
 @router.delete("/{video_id}", response_model=VideoDeleteResponse, status_code=200)

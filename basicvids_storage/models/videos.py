@@ -4,6 +4,8 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, computed_field
 from sqlmodel import Field, SQLModel
 
+from basicvids_storage.models.categories import CategorySummary
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -20,6 +22,7 @@ class Video(SQLModel, table=True):
     author_username: str | None = Field(default=None, max_length=100)
     author_first_name: str | None = Field(default=None, max_length=100)
     author_last_name: str | None = Field(default=None, max_length=100)
+    category_id: int | None = Field(default=None, foreign_key="category.id", index=True)
     storage_backend: str = Field(default="disk", max_length=50)
     storage_key: str = Field(unique=True, max_length=500)
     thumbnail_storage_key: str | None = Field(default=None, max_length=500)
@@ -55,6 +58,7 @@ class VideoUploadSession(SQLModel, table=True):
     author_username: str | None = Field(default=None, max_length=100)
     author_first_name: str | None = Field(default=None, max_length=100)
     author_last_name: str | None = Field(default=None, max_length=100)
+    category_id: int | None = Field(default=None, foreign_key="category.id", index=True)
     status: str = Field(default="uploading", max_length=20, index=True)
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -78,6 +82,8 @@ class VideoPublic(BaseModel):
     author_username: str | None = None
     author_first_name: str | None = None
     author_last_name: str | None = None
+    category_id: int | None = None
+    category: CategorySummary | None = None
     storage_backend: str
     status: str
     processing_error: str | None = None
@@ -101,6 +107,7 @@ class VideoPublic(BaseModel):
 class VideoChange(BaseModel):
     title: str
     description: str | None = None
+    category_id: int | None = None
 
 
 class VideoList(BaseModel):
@@ -119,6 +126,7 @@ class VideoUploadSessionCreate(BaseModel):
     content_type: str
     total_size_bytes: int = PydanticField(gt=0)
     chunk_size_bytes: int | None = PydanticField(default=None, gt=0)
+    category_id: int | None = PydanticField(default=None, ge=1)
 
 
 class VideoUploadSessionPublic(BaseModel):
@@ -132,6 +140,7 @@ class VideoUploadSessionPublic(BaseModel):
     total_size_bytes: int
     chunk_size_bytes: int
     author_id: int
+    category_id: int | None = None
     status: str
     created_at: datetime
     received_chunks: list[int] = PydanticField(default_factory=list)
