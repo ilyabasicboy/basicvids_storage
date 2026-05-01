@@ -3,7 +3,7 @@ import math
 import shutil
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
@@ -36,6 +36,9 @@ from basicvids_storage.tasks import enqueue_video_processing
 
 
 router = APIRouter(tags=["Videos"], prefix="/videos")
+
+DurationFilter = Literal["under_3", "3_20", "over_20"]
+UploadedFilter = Literal["today", "week", "month", "year"]
 
 
 def validate_thumbnail_upload(file: UploadFile) -> None:
@@ -124,6 +127,26 @@ def get_categories_by_ids(session: Session, category_ids: list[int]) -> dict[int
         return {}
     categories = session.exec(select(Category).where(col(Category.id).in_(category_ids))).all()
     return {category.id: category for category in categories if category.id is not None}
+
+
+def duration_filter_expressions(duration: DurationFilter):
+    if duration == "under_3":
+        return [Video.duration_seconds < 180]
+    if duration == "3_20":
+        return [Video.duration_seconds >= 180, Video.duration_seconds <= 1200]
+    return [Video.duration_seconds > 1200]
+
+
+def uploaded_since_filter(uploaded: UploadedFilter):
+    now = utc_now()
+    if uploaded == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if uploaded == "week":
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_of_day - timedelta(days=start_of_day.weekday())
+    if uploaded == "month":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def hls_media_type(storage_key: str) -> str:
@@ -450,8 +473,10 @@ async def list_videos(
     limit: int = Query(default=30, ge=1, le=30),
     search: str | None = Query(default=None, max_length=255),
     author_id: int | None = Query(default=None, ge=1),
-    category_id: int | None = Query(default=None, ge=1),
+    category_id: list[int] = Query(default_factory=list),
     include_subcategories: bool = Query(default=True),
+    duration: DurationFilter | None = Query(default=None),
+    uploaded: UploadedFilter | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> VideoList:
     statement = select(Video)
@@ -463,18 +488,32 @@ async def list_videos(
         statement = statement.where(author_filter)
         count_statement = count_statement.where(author_filter)
 
-    if category_id is not None:
+    if category_id:
         all_categories = session.exec(select(Category)).all()
-        if not any(category.id == category_id for category in all_categories):
+        all_category_ids = {category.id for category in all_categories}
+        selected_category_ids = set(category_id)
+        if not selected_category_ids.issubset(all_category_ids):
             raise HTTPException(status_code=404, detail="Category not found")
-        category_ids = (
-            collect_descendant_ids(all_categories, category_id)
-            if include_subcategories
-            else {category_id}
-        )
+        category_ids = set()
+        for selected_category_id in selected_category_ids:
+            category_ids.update(
+                collect_descendant_ids(all_categories, selected_category_id)
+                if include_subcategories
+                else {selected_category_id}
+            )
         category_filter = col(Video.category_id).in_(category_ids)
         statement = statement.where(category_filter)
         count_statement = count_statement.where(category_filter)
+
+    if duration is not None:
+        for filter_expression in duration_filter_expressions(duration):
+            statement = statement.where(filter_expression)
+            count_statement = count_statement.where(filter_expression)
+
+    if uploaded is not None:
+        uploaded_filter = Video.created_at >= uploaded_since_filter(uploaded)
+        statement = statement.where(uploaded_filter)
+        count_statement = count_statement.where(uploaded_filter)
 
     if clean_search:
         search_pattern = f"%{clean_search.lower()}%"

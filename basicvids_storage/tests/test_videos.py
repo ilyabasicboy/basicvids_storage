@@ -365,6 +365,99 @@ class TestVideosRead(BaseTestVideos):
         assert response_data["count"] == 1
         assert response_data["videos"][0]["category"]["slug"] == "education"
 
+    async def test_list_videos_filters_by_multiple_categories(self):
+        education = self.create_category("Education", "education")
+        travel = self.create_category("Travel", "travel")
+        cooking = self.create_category("Cooking", "cooking")
+
+        await self.create_video(title="Course", category_id=education.id)
+        await self.create_video(title="Road trip", category_id=travel.id)
+        await self.create_video(title="Recipe", category_id=cooking.id)
+
+        response = await request(
+            "GET",
+            f"{self.method_url}/",
+            params=[("category_id", education.id), ("category_id", travel.id)],
+        )
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 2
+        assert {video["category"]["slug"] for video in response_data["videos"]} == {"education", "travel"}
+
+    async def test_list_videos_filters_by_duration(self):
+        with Session(engine) as session:
+            for title, duration_seconds in [
+                ("Short clip", 120),
+                ("Class recording", 600),
+                ("Feature lesson", 1500),
+            ]:
+                session.add(
+                    Video(
+                        title=title,
+                        description=None,
+                        original_filename=f"{title}.mp4",
+                        content_type="video/mp4",
+                        size_bytes=10,
+                        author_id=1,
+                        author_username="user-1",
+                        storage_backend="disk",
+                        storage_key=title,
+                        status="ready",
+                        duration_seconds=duration_seconds,
+                    )
+                )
+            session.commit()
+
+        response = await request("GET", f"{self.method_url}/", params={"duration": "3_20"})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 1
+        assert response_data["videos"][0]["title"] == "Class recording"
+
+    async def test_list_videos_filters_by_upload_period(self):
+        now = utc_now()
+        with Session(engine) as session:
+            session.add(
+                Video(
+                    title="Fresh clip",
+                    description=None,
+                    original_filename="fresh.mp4",
+                    content_type="video/mp4",
+                    size_bytes=10,
+                    author_id=1,
+                    author_username="user-1",
+                    storage_backend="disk",
+                    storage_key="fresh-video",
+                    status="ready",
+                    created_at=now,
+                )
+            )
+            session.add(
+                Video(
+                    title="Old clip",
+                    description=None,
+                    original_filename="old.mp4",
+                    content_type="video/mp4",
+                    size_bytes=10,
+                    author_id=1,
+                    author_username="user-1",
+                    storage_backend="disk",
+                    storage_key="old-video",
+                    status="ready",
+                    created_at=now - timedelta(days=400),
+                )
+            )
+            session.commit()
+
+        response = await request("GET", f"{self.method_url}/", params={"uploaded": "year"})
+
+        assert response.status_code == 200
+        response_data = response.json()
+        assert response_data["count"] == 1
+        assert response_data["videos"][0]["title"] == "Fresh clip"
+
     async def test_get_video_marks_stale_processing_as_failed(self):
         response = await request(
             "POST",
