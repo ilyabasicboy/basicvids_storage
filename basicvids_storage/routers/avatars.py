@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlmodel import Session
 
 from basicvids_storage.auth import CurrentUser, get_current_user
@@ -14,6 +14,16 @@ from basicvids_storage.storage.base import StorageBackend
 
 
 router = APIRouter(tags=["Avatars"], prefix="/avatars")
+
+DEFAULT_AVATAR_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Default avatar">
+  <rect width="96" height="96" rx="18" fill="#d7dee8"/>
+  <circle cx="48" cy="36" r="18" fill="#f7f9fc"/>
+  <path d="M20 84c3-18 16-28 28-28s25 10 28 28" fill="#f7f9fc"/>
+</svg>"""
+
+
+def placeholder_avatar_response() -> Response:
+    return Response(content=DEFAULT_AVATAR_SVG, media_type="image/svg+xml")
 
 
 def validate_avatar_upload(file: UploadFile) -> None:
@@ -127,11 +137,11 @@ async def download_user_avatar(
 ) -> StreamingResponse:
     avatar = session.get(Avatar, user_id)
     if not avatar:
-        raise HTTPException(status_code=404, detail="Avatar not found")
+        return placeholder_avatar_response()
 
     file_path = storage.path_for(avatar.storage_key)
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Avatar file not found")
+        return placeholder_avatar_response()
 
     async def stream_file():
         with file_path.open("rb") as stored_file:

@@ -133,4 +133,13 @@ class TestAvatars(BaseTestAvatars):
         assert list(Path(temporary_directory.name).iterdir()) == []
 
         response = await request("GET", "/api/v1/avatars/users/1/image/")
-        assert response.status_code == 404
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/svg+xml"
+        assert "<svg" in response.text
+
+    async def test_missing_avatar_returns_placeholder_image(self):
+        response = await request("GET", "/api/v1/avatars/users/999/image/")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/svg+xml"
+        assert "<svg" in response.text
