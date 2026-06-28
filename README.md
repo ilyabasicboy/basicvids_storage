@@ -2,22 +2,24 @@
 
 Video storage microservice for BasicVids.
 
-The first backend stores uploaded videos on local disk. Storage access is isolated behind a small backend interface so a cloud backend can be added later without changing the API routes.
+The service stores uploaded videos on local disk, tracks metadata in the database, and offloads transcoding and HLS generation to Celery workers.
 
 ## Stack
 
-* Gunicorn
-* FastAPI
-* SQLModel
-* Disk storage backend
+- Gunicorn
+- FastAPI
+- SQLModel
+- Redis
+- Celery
+- ffmpeg / ffprobe
 
 ## Development
 
-Use a virtual environment. Do not install packages into the system Python:
+Use a virtual environment:
 
 ```bash
-virtualenv .venv
-source .venv/bin/activate
+virtualenv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -35,10 +37,9 @@ uvicorn basicvids_storage.main:app --reload
 
 ## Container
 
-Each BasicVids microservice should run in its own container and use the shared `basicvids_gateway` project for public HTTP access. Start this service with:
-
 ```bash
 mkdir -p data
+cp .env.example data/.env
 docker compose up -d --build
 ```
 
@@ -46,62 +47,59 @@ The service is available through the shared gateway at:
 
 ```text
 http://localhost:8080/api/v1/videos/
+http://localhost:8080/api/v1/categories/
 ```
 
-## Image Configuration
+## Configuration
 
-Environment variables:
-
-| Variable              | Default                | Description                         |
-| --------------------- | ---------------------- | ----------------------------------- |
-| DATA_PATH             | ./data                 | Data directory mounted in container |
-| STORAGE_BACKEND       | disk                   | Storage backend name                |
-| DATABASE_URL          | sqlite:///./data/database.db | Metadata database URL        |
-| VIDEO_STORAGE_DIR     | videos                 | Directory inside DATA_PATH for files |
-| MAX_UPLOAD_SIZE_BYTES | 2147483648             | Maximum upload size                 |
-| AUTH_CURRENT_USER_URL | http://basicvids_auth:8000/api/v1/users/detail/ | Auth service current-user endpoint |
-
-Project environment can be placed in:
+Project environment is loaded from:
 
 ```text
 ./data/.env
 ```
 
-## API Documentation
+Start from:
 
-### Health Check
+```text
+./.env.example
+```
 
-- **GET** `/health`
-  - **Response:** `{ "status": "ok" }`
+Database examples:
 
-### Videos
+```env
+# SQLite default
+# DATABASE_URL=sqlite:///./data/database.db
 
-- **POST** `/api/v1/videos/uploads/`
-  - Create resumable upload session
-- **PUT** `/api/v1/videos/uploads/{upload_id}/chunks/{chunk_index}`
-  - Upload chunk
-- **POST** `/api/v1/videos/uploads/{upload_id}/complete/`
-  - Finalize resumable upload and create video
-  - **Requires:** authentication
-  - **Form fields:** `file`, `title`, `description` optional
-  - **Accepts:** `video/*`
-  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
+# PostgreSQL example
+DATABASE_URL=postgresql://basicvids_storage_user:change_me@host.docker.internal:5432/basicvids_storage
+```
 
-- **GET** `/api/v1/videos/`
-  - **Query parameters:** `offset` (default: 0), `limit` (default: 20, max: 100)
-  - **Response:** `{ videos: [...], count }`
+Important variables:
 
-- **GET** `/api/v1/videos/{video_id}`
-  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATA_PATH` | `./data` | Data directory mounted in container |
+| `DATABASE_URL` | `sqlite:///./data/database.db` | Metadata database URL |
+| `REDIS_URL` | `redis://localhost:6379/2` | Redis connection for rate limiting and app state |
+| `CELERY_BROKER_URL` | `redis://basicvids_redis:6379/0` | Celery broker |
+| `CELERY_RESULT_BACKEND` | `redis://basicvids_redis:6379/1` | Celery result backend |
+| `AUTH_CURRENT_USER_URL` | `http://basicvids_auth:8000/api/v1/users/detail/` | Auth service current-user endpoint |
+| `VIDEO_TRANSCODE_WORKER_CONCURRENCY` | `1` | Celery worker concurrency |
+| `VIDEO_TRANSCODE_THREADS` | `2` | ffmpeg thread count per transcode |
 
-- **PATCH** `/api/v1/videos/{video_id}`
-  - **Requires:** authentication as the video author or an admin
-  - **Body:** `{ "title": "Video title", "description": "Description or null" }`
-  - **Response:** `{ id, title, description, original_filename, content_type, size_bytes, author_id, author_username, author_first_name, author_last_name, storage_backend, created_at }`
+## Runtime Notes
 
-- **GET** `/api/v1/videos/{video_id}/download/`
-  - **Response:** video file
+Local development requires more than Python packages:
 
-- **DELETE** `/api/v1/videos/{video_id}`
-  - **Requires:** authentication as the video author or an admin
-  - **Response:** `{ "message": "Video deleted successfully" }`
+- Redis
+- Celery worker
+- `ffmpeg`
+- `ffprobe`
+
+The docker compose file starts both API and worker containers.
+
+## Healthcheck
+
+```text
+http://localhost:8080/storage/health
+```

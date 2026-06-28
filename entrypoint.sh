@@ -11,7 +11,7 @@ fi
 
 export $(grep -v '^#' "$ENV_FILE" | xargs)
 
-WORKERS=$(python -c "import multiprocessing; print(multiprocessing.cpu_count() * 2 + 1)")
+WORKERS="${WORKERS:-1}"
 
 echo "Starting server with $WORKERS workers"
 
