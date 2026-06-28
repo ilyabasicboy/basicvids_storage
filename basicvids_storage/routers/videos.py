@@ -33,12 +33,30 @@ from basicvids_storage.settings import settings
 from basicvids_storage.storage import get_storage
 from basicvids_storage.storage.base import StorageBackend
 from basicvids_storage.tasks import enqueue_video_processing
+from basicvids_storage.thumbnails import probe_video_stream
 
 
 router = APIRouter(tags=["Videos"], prefix="/videos")
 
 DurationFilter = Literal["under_3", "3_20", "over_20"]
 UploadedFilter = Literal["today", "week", "month", "year"]
+SUPPORTED_SOURCE_VIDEO_EXTENSIONS = {
+    ".3gp",
+    ".avi",
+    ".flv",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".mts",
+    ".ogv",
+    ".ts",
+    ".webm",
+    ".wmv",
+}
 
 
 def validate_thumbnail_upload(file: UploadFile) -> None:
@@ -48,10 +66,16 @@ def validate_thumbnail_upload(file: UploadFile) -> None:
         raise HTTPException(status_code=415, detail="Only image thumbnails are supported")
 
 
+def is_supported_video_upload(content_type: str | None, original_filename: str) -> bool:
+    if content_type and content_type.startswith("video/"):
+        return True
+    return Path(original_filename).suffix.lower() in SUPPORTED_SOURCE_VIDEO_EXTENSIONS
+
+
 def validate_upload_session_payload(data: VideoUploadSessionCreate) -> None:
     if not data.original_filename.strip():
         raise HTTPException(status_code=400, detail="Filename is required")
-    if not data.content_type or not data.content_type.startswith("video/"):
+    if not is_supported_video_upload(data.content_type, data.original_filename):
         raise HTTPException(status_code=415, detail="Only video uploads are supported")
     if data.total_size_bytes > settings.MAX_UPLOAD_SIZE_BYTES:
         raise HTTPException(status_code=413, detail="Upload is too large")
@@ -372,6 +396,9 @@ async def complete_upload_session(
         with assembled_path.open("wb") as assembled_file:
             for chunk_index in range(total_chunks):
                 assembled_file.write(upload_chunk_path(upload_id, chunk_index).read_bytes())
+
+        if not await probe_video_stream(assembled_path, settings.THUMBNAIL_GENERATION_TIMEOUT_SECONDS):
+            raise HTTPException(status_code=415, detail="Unsupported or unreadable video format")
 
         suffix = Path(upload_session.original_filename).suffix or ".mp4"
         stored_object = storage.save_file(assembled_path, suffix, settings.MAX_UPLOAD_SIZE_BYTES)

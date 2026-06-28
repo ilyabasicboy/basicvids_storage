@@ -50,6 +50,9 @@ class BaseTestVideos:
         async def probe_duration(_video_path, _timeout):
             return 125.0
 
+        async def probe_stream(_video_path, _timeout):
+            return True
+
         async def generate_thumbnail(_video_path, _storage, _settings):
             return None
 
@@ -70,6 +73,7 @@ class BaseTestVideos:
         monkeypatch.setattr(video_tasks, "generate_hls_video", generate_hls)
         monkeypatch.setattr(video_tasks, "probe_video_duration", probe_duration)
         monkeypatch.setattr(video_tasks, "generate_video_thumbnail", generate_thumbnail)
+        monkeypatch.setattr(videos_router, "probe_video_stream", probe_stream)
         monkeypatch.setattr(video_tasks, "engine", engine)
         monkeypatch.setattr(video_tasks, "build_storage", lambda: DiskStorage(root_path=temporary_directory.name))
         monkeypatch.setattr(videos_router.settings, "DATA_PATH", Path(temporary_directory.name))
@@ -140,6 +144,58 @@ class TestVideoResumableUpload(BaseTestVideos):
         assert response.status_code == 201
         return response.json()
 
+    async def test_create_upload_session_accepts_known_video_extension_with_octet_stream(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            json={
+                "title": "AVI clip",
+                "description": "Legacy container",
+                "original_filename": "clip.avi",
+                "content_type": "application/octet-stream",
+                "total_size_bytes": 10,
+                "chunk_size_bytes": 4,
+            },
+        )
+
+        assert response.status_code == 201
+        response_data = response.json()
+        assert response_data["original_filename"] == "clip.avi"
+        assert response_data["content_type"] == "application/octet-stream"
+
+    async def test_create_upload_session_accepts_known_video_extension_without_content_type(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            json={
+                "title": "WMV clip",
+                "description": "Legacy Windows Media container",
+                "original_filename": "clip.wmv",
+                "content_type": "",
+                "total_size_bytes": 10,
+                "chunk_size_bytes": 4,
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["original_filename"] == "clip.wmv"
+
+    async def test_create_upload_session_rejects_unknown_non_video_content_type(self):
+        response = await request(
+            "POST",
+            self.method_url,
+            json={
+                "title": "Archive",
+                "description": "Not a video",
+                "original_filename": "clip.zip",
+                "content_type": "application/octet-stream",
+                "total_size_bytes": 10,
+                "chunk_size_bytes": 4,
+            },
+        )
+
+        assert response.status_code == 415
+
     async def test_create_upload_session_success(self):
         response = await request(
             "POST",
@@ -198,6 +254,25 @@ class TestVideoResumableUpload(BaseTestVideos):
 
         with Session(engine) as session:
             assert session.get(VideoUploadSession, upload_id) is None
+
+    async def test_complete_upload_rejects_unreadable_video_for_ffmpeg_pipeline(self, monkeypatch):
+        async def probe_stream(_video_path, _timeout):
+            return False
+
+        monkeypatch.setattr(videos_router, "probe_video_stream", probe_stream)
+
+        upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=10)
+        upload_id = upload_session["id"]
+        await request("PUT", f"{self.method_url}{upload_id}/chunks/0", content=b"fake-video")
+
+        response = await request("POST", f"{self.method_url}{upload_id}/complete/")
+
+        assert response.status_code == 415
+        assert response.json()["detail"] == "Unsupported or unreadable video format"
+
+        response = await request("GET", f"{self.method_url}{upload_id}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "uploading"
 
     async def test_complete_upload_requires_all_chunks(self):
         upload_session = await self.create_upload_session(total_size_bytes=10, chunk_size_bytes=4)

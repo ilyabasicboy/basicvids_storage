@@ -38,6 +38,23 @@ async def _run_command(*args: str, timeout: int) -> tuple[int, str, str]:
     )
 
 
+async def probe_video_stream(video_path: Path, timeout: int) -> bool:
+    returncode, stdout, _stderr = await _run_command(
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+        timeout=timeout,
+    )
+    return returncode == 0 and bool(stdout.strip())
+
+
 async def probe_video_duration(video_path: Path, timeout: int) -> float | None:
     returncode, stdout, _stderr = await _run_command(
         "ffprobe",
